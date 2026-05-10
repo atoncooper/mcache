@@ -30,12 +30,10 @@ func daemonize() {
 		os.Exit(1)
 	}
 
-	// Write PID file if requested.
-	if serverPidFile != "" {
-		pid := fmt.Sprintf("%d\n", cmd.Process.Pid)
-		os.WriteFile(serverPidFile, []byte(pid), 0644)
-	}
+	// Always write PID file (default: mcache.pid).
+	pid := fmt.Sprintf("%d\n", cmd.Process.Pid)
+	os.WriteFile(serverPidFile, []byte(pid), 0644)
 
-	fmt.Printf("Server started (pid: %d)\n", cmd.Process.Pid)
+	fmt.Printf("Server started (pid: %d, pidfile: %s)\n", cmd.Process.Pid, serverPidFile)
 	os.Exit(0)
 }

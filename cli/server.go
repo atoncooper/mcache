@@ -162,7 +162,7 @@ On Windows, use Docker or Start-Process to background the server.`,
 func init() {
 	serverCmd.Flags().StringVar(&serverConfigPath, "config", "config.yaml", "path to configuration file")
 	serverCmd.Flags().BoolVar(&serverDaemon, "daemon", false, "run server in background (Linux/macOS only)")
-	serverCmd.Flags().StringVar(&serverPidFile, "pidfile", "", "write PID to file (used with --daemon)")
+	serverCmd.Flags().StringVar(&serverPidFile, "pidfile", "mcache.pid", "PID file (used with --daemon / stop)")
 	rootCmd.AddCommand(serverCmd)
 }
 
