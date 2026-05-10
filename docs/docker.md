@@ -36,19 +36,42 @@ docker exec mcache mcache get hello
 
 ## 构建镜像
 
-### 本地构建
+### 国内用户（必须指定 GOPROXY）
+
+默认 Go 代理 `proxy.golang.org` 在国内不可用，构建时会报 `i/o timeout`。
+**必须**使用以下命令构建：
 
 ```bash
-# 默认版本
-docker build -t mcache:latest .
+# 仅国内代理（推荐）
+docker build --build-arg GOPROXY=https://goproxy.cn,direct -t mcache:latest .
 
-# 指定版本
+# 指定版本 + 国内代理
 docker build \
+    --build-arg GOPROXY=https://goproxy.cn,direct \
     --build-arg VERSION=2.0.0 \
     --build-arg COMMIT=$(git rev-parse --short HEAD) \
     --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
     -t mcache:2.0.0 \
     -t mcache:latest .
+```
+
+> 如果你有科学上网环境（或服务器在海外），可以省略 `--build-arg GOPROXY`，Dockerfile 已内置 `proxy.golang.org, goproxy.cn, direct` 三重回退。
+
+### 海外用户（默认即可）
+
+```bash
+docker build -t mcache:latest .
+```
+
+### 使用 Docker Compose 构建
+
+```bash
+# 国内：先设置环境变量
+export GOPROXY=https://goproxy.cn,direct
+docker compose build
+
+# 海外
+docker compose build
 ```
 
 ### 镜像分层说明
@@ -318,34 +341,7 @@ docker buildx build \
 
 ### `go mod download` 超时（国内网络）
 
-```
-dial tcp 142.250.73.145:443: i/o timeout
-```
-
-**原因**：默认 Go 代理 `proxy.golang.org` 在国内访问缓慢或被墙。
-
-**方案一**：构建时指定国内代理
-
-```bash
-docker build --build-arg GOPROXY=https://goproxy.cn,direct -t mcache .
-```
-
-**方案二**：配置 Docker daemon 全局代理（永久生效）
-
-编辑 `~/.docker/config.json`：
-
-```json
-{
-  "proxies": {
-    "default": {
-      "httpProxy": "http://127.0.0.1:7890",
-      "httpsProxy": "http://127.0.0.1:7890"
-    }
-  }
-}
-```
-
-**方案三**：设置系统环境变量后构建
+见上方 [构建镜像 → 国内用户](#国内用户必须指定-goproxy) 章节，使用 `--build-arg GOPROXY=https://goproxy.cn,direct` 即可。
 
 ```bash
 export GOPROXY=https://goproxy.cn,direct

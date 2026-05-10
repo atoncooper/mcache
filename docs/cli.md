@@ -16,7 +16,8 @@
 
 | 命令 | 说明 |
 |------|------|
-| `mcache server` | 启动 TCP 服务端 |
+| `mcache server [--daemon] [--pidfile]` | 启动 TCP 服务端 |
+| `mcache monitor` | 系统资源监控 |
 | `mcache version` | 版本信息 |
 | `mcache help` | 帮助 |
 
@@ -100,12 +101,76 @@
 
 ## 启动服务端
 
+### 基本启动
+
 ```bash
-# 默认配置（./config.yaml）
+# 使用默认配置（./config.yaml）
 mcache server
 
 # 指定配置文件
 mcache server --config /etc/mcache/config.yaml
+```
+
+服务启动后在**前台运行**，`Ctrl+C` 停止。
+
+### 后台启动
+
+**Linux / macOS：**
+
+```bash
+# 后台运行
+mcache server --daemon
+# → Server started (pid: 12345)
+
+# 后台运行 + 写入 PID 文件（方便 systemd / 脚本管理）
+mcache server --daemon --pidfile /var/run/mcache.pid
+
+# 停止
+kill $(cat /var/run/mcache.pid)
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--daemon` | 后台运行（fork 子进程后父进程退出） |
+| `--pidfile <path>` | 将子进程 PID 写入文件 |
+
+**Linux systemd 服务文件**（推荐生产环境）：
+
+```ini
+# /etc/systemd/system/mcache.service
+[Unit]
+Description=mcache cache server
+After=network.target
+
+[Service]
+Type=simple
+User=mcache
+ExecStart=/usr/local/bin/mcache server --config /etc/mcache/config.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now mcache
+```
+
+**Windows：**
+
+`--daemon` 不支持 Windows。使用以下替代方案：
+
+```powershell
+# 方案 1：PowerShell 后台进程
+Start-Process -NoNewWindow -FilePath .\mcache.exe -ArgumentList "server"
+
+# 方案 2：Docker（推荐）
+docker run -d --name mcache -p 11211:11211 atoncooper/mcache:latest
+
+# 方案 3：任务计划程序（开机自启）
+# 创建一个计划任务，触发器设为 "系统启动时"
 ```
 
 ## 客户端操作示例

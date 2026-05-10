@@ -21,13 +21,25 @@ import (
 	mnet "github.com/atoncooper/mcache/net"
 )
 
-var serverConfigPath string
+var (
+	serverConfigPath string
+	serverDaemon     bool
+	serverPidFile    string
+)
 
 var serverCmd = &cobra.Command{
 	Use:   "server",
 	Short: "Start the mcache TCP server",
-	Long:  `Start the mcache TCP server with the given configuration file.`,
+	Long: `Start the mcache TCP server with the given configuration file.
+
+Use --daemon to run in the background (Linux/macOS only).
+On Windows, use Docker or Start-Process to background the server.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Daemon mode: fork and exit parent (Linux/macOS only).
+		if serverDaemon {
+			daemonize()
+		}
+
 		cfg, err := mcache.LoadConfig(serverConfigPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: load config: %v\n", err)
@@ -149,6 +161,8 @@ var serverCmd = &cobra.Command{
 
 func init() {
 	serverCmd.Flags().StringVar(&serverConfigPath, "config", "config.yaml", "path to configuration file")
+	serverCmd.Flags().BoolVar(&serverDaemon, "daemon", false, "run server in background (Linux/macOS only)")
+	serverCmd.Flags().StringVar(&serverPidFile, "pidfile", "", "write PID to file (used with --daemon)")
 	rootCmd.AddCommand(serverCmd)
 }
 
