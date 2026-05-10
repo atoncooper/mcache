@@ -15,6 +15,7 @@ var rootCmd = &cobra.Command{
 
 Server:
   server    Start the TCP cache server
+  stop      Stop a background server
 
 KV:
   get       Retrieve a value by key
