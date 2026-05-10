@@ -133,22 +133,28 @@ kill $(cat /var/run/mcache.pid)
 | 参数 | 说明 |
 |------|------|
 | `--daemon` | 后台运行（fork 子进程后父进程退出） |
-| `--pidfile <path>` | 将子进程 PID 写入文件 |
+| `--pidfile <path>` | PID 文件路径（默认 `./mcache.pid`） |
 
-**停止后台服务：**
+启动时自动写 PID 文件，`stop` 读取同一个文件：
 
 ```bash
-# 使用默认 PID 文件（./mcache.pid）
-mcache stop
+# 后台启动（自动创建 ./mcache.pid）
+mcache server --daemon
+# → Server started (pid: 2833248, pidfile: mcache.pid)
 
-# 指定 PID 文件
+# 停止（自动读取 ./mcache.pid）
+mcache stop
+# → Server stopped (pid 2833248)
+
+# 自定义 PID 路径
+mcache server --daemon --pidfile /var/run/mcache.pid
 mcache stop --pidfile /var/run/mcache.pid
 
-# 重启 = 停止 + 启动
-mcache stop && mcache server --daemon --pidfile mcache.pid
+# 重启
+mcache stop && mcache server --daemon
 ```
 
-`stop` 命令先发送 SIGTERM 等待优雅退出（最多 6 秒），超时后发送 SIGKILL 强制终止。
+`stop` 先发送 SIGTERM 等待优雅退出（最多 6 秒），超时后发送 SIGKILL 强制终止。
 
 **Linux systemd 服务文件**（推荐生产环境）：
 
