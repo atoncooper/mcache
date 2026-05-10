@@ -1,6 +1,9 @@
 services:
   mcache:
-    build: .
+    build:
+      context: .
+      args:
+        - GOPROXY=${GOPROXY:-https://proxy.golang.org,https://goproxy.cn,direct}
     image: atoncooper/mcache:latest
     container_name: mcache
     ports:

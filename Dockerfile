@@ -3,6 +3,10 @@ FROM golang:1.24-alpine AS builder
 
 WORKDIR /build
 
+# Go module proxy (auto-fallback: Google → CN mirror → direct)
+ARG GOPROXY=https://proxy.golang.org,https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
+
 COPY go.mod go.sum ./
 RUN go mod download
 
@@ -27,14 +31,14 @@ RUN adduser -D -H mcache && \
 
 COPY --from=builder /build/mcache /usr/local/bin/mcache
 
-# Default config (override via volume mount or env)
+# Default config (override via volume mount)
 COPY config.yaml /etc/mcache/config.yaml
 
 USER mcache
 EXPOSE 11211
 
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
-    CMD mcache ping 2>/dev/null || exit 1
+    CMD mcache ping || exit 1
 
 ENTRYPOINT ["mcache"]
 CMD ["server", "--config", "/etc/mcache/config.yaml"]

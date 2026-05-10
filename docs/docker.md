@@ -311,3 +311,67 @@ docker buildx build \
 | 停止删除 | `docker rm -f mcache` |
 | 进入 shell | `docker exec -it mcache sh` |
 | 拉取更新 | `docker pull atoncooper/mcache:latest` |
+
+---
+
+## 常见问题
+
+### `go mod download` 超时（国内网络）
+
+```
+dial tcp 142.250.73.145:443: i/o timeout
+```
+
+**原因**：默认 Go 代理 `proxy.golang.org` 在国内访问缓慢或被墙。
+
+**方案一**：构建时指定国内代理
+
+```bash
+docker build --build-arg GOPROXY=https://goproxy.cn,direct -t mcache .
+```
+
+**方案二**：配置 Docker daemon 全局代理（永久生效）
+
+编辑 `~/.docker/config.json`：
+
+```json
+{
+  "proxies": {
+    "default": {
+      "httpProxy": "http://127.0.0.1:7890",
+      "httpsProxy": "http://127.0.0.1:7890"
+    }
+  }
+}
+```
+
+**方案三**：设置系统环境变量后构建
+
+```bash
+export GOPROXY=https://goproxy.cn,direct
+docker build -t mcache .
+```
+
+> 注：Dockerfile 已内置双重回退 `GOPROXY=https://proxy.golang.org,https://goproxy.cn,direct`，通常无需手动设置。
+
+### 容器启动后立即退出
+
+```bash
+docker logs mcache
+# 查看错误日志
+
+# 常见原因：config.yaml 中 address 被设为无效值
+# 检查：确保 server.address 是容器内监听地址 ":11211"
+```
+
+### HEALTHCHECK 失败
+
+```bash
+docker inspect mcache | grep -A5 Health
+# 查看健康检查状态
+
+# 排查：
+docker exec mcache mcache ping
+# 如果返回错误，检查服务是否正在监听
+docker exec mcache sh -c "netstat -tlnp | grep 11211"
+```
