@@ -1,0 +1,531 @@
+package mcache
+
+import (
+	"errors"
+	"hash/fnv"
+	"sync"
+	"time"
+
+	"github.com/atoncooper/mcache/rehash"
+	"github.com/atoncooper/mcache/ds/set"
+)
+
+// Cache is a thread-safe in-memory cache with sharding for reduced lock contention.
+// Supports pluggable rehashing strategies to resize shard count.
+type Cache struct {
+	shards []rehash.Shard
+	mask   uint32
+	opts   Options
+	closed bool
+	mu     sync.RWMutex
+
+	rehasher rehash.Rehasher
+
+	// Eviction policy factory used when creating new shards or swapping at runtime.
+	policyName    string
+	policyFactory PolicyFactory
+	policyMu      sync.RWMutex
+	perShardMax   int
+
+	observer CacheObserver
+}
+
+// New creates a Cache with the given options.
+func New(opts Options) (*Cache, error) {
+	if opts.shardCount <= 0 || (opts.shardCount&(opts.shardCount-1)) != 0 {
+		return nil, ErrInvalidShards
+	}
+	if opts.maxSize < 0 {
+		opts.maxSize = 0
+	}
+	if opts.defaultTTL < 0 {
+		return nil, ErrNegativeTTL
+	}
+	if opts.evictionPolicy == "" {
+		opts.evictionPolicy = "noop"
+	}
+	factory, err := getPolicyFactory(opts.evictionPolicy)
+	if err != nil {
+		return nil, err
+	}
+
+	if opts.rehasher == "" {
+		opts.rehasher = "incremental"
+	}
+	rFactory, err := rehash.GetFactory(opts.rehasher)
+	if err != nil {
+		return nil, err
+	}
+
+	perShardMax := 0
+	if opts.maxSize > 0 {
+		perShardMax = opts.maxSize / opts.shardCount
+		if perShardMax < 1 {
+			perShardMax = 1
+		}
+	}
+
+	if opts.observer == nil {
+		opts.observer = &noopObserver{}
+	}
+	c := &Cache{
+		shards:        make([]rehash.Shard, opts.shardCount),
+		mask:          uint32(opts.shardCount - 1),
+		opts:          opts,
+		policyName:    opts.evictionPolicy,
+		policyFactory: factory,
+		perShardMax:   perShardMax,
+		observer:      opts.observer,
+		rehasher:      rFactory(),
+	}
+	for i := range c.shards {
+		c.shards[i] = newShard(factory(), perShardMax, c.observer)
+	}
+	return c, nil
+}
+
+// SetEvictionPolicy hot-swaps the eviction strategy at runtime.
+// It replaces the policy in every shard and migrates existing keys.
+func (c *Cache) SetEvictionPolicy(name string) error {
+	factory, err := getPolicyFactory(name)
+	if err != nil {
+		return err
+	}
+	if err := c.validateOpen(); err != nil {
+		return err
+	}
+
+	c.policyMu.Lock()
+	c.policyName = name
+	c.policyFactory = factory
+	c.policyMu.Unlock()
+
+	c.mu.RLock()
+	for _, s := range c.shards {
+		s.(*shard).swapPolicy(factory())
+	}
+	c.mu.RUnlock()
+
+	for _, s := range c.rehasher.OldShards() {
+		if s != nil {
+			s.(*shard).swapPolicy(factory())
+		}
+	}
+	return nil
+}
+
+// SetRehasher hot-swaps the rehashing strategy at runtime.
+// If a rehash is in progress, it is aborted and the new strategy takes over
+// on the next Resize.
+func (c *Cache) SetRehasher(name string) error {
+	factory, err := rehash.GetFactory(name)
+	if err != nil {
+		return err
+	}
+	if err := c.validateOpen(); err != nil {
+		return err
+	}
+
+	c.rehasher.Stop()
+	c.rehasher = factory()
+	return nil
+}
+
+// Rehasher returns the current rehasher name.
+func (c *Cache) Rehasher() string {
+	return c.rehasher.Name()
+}
+
+// EvictionPolicy returns the current eviction policy name.
+func (c *Cache) EvictionPolicy() string {
+	c.policyMu.RLock()
+	defer c.policyMu.RUnlock()
+	return c.policyName
+}
+
+// Resize starts rehashing to a new shard count (must be power of two).
+func (c *Cache) Resize(shardCount int) error {
+	if err := c.validateOpen(); err != nil {
+		return err
+	}
+	if shardCount <= 0 || (shardCount&(shardCount-1)) != 0 {
+		return ErrInvalidShards
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrCacheClosed
+	}
+	if c.rehasher.IsRehashing() {
+		return errors.New("rehash already in progress")
+	}
+
+	c.policyMu.RLock()
+	factory := c.policyFactory
+	c.policyMu.RUnlock()
+
+	perShardMax := 0
+	if c.opts.maxSize > 0 {
+		perShardMax = c.opts.maxSize / shardCount
+		if perShardMax < 1 {
+			perShardMax = 1
+		}
+	}
+
+	c.observer.OnRehashStart(len(c.shards), shardCount)
+	c.rehasher.Start(c.shards, c.mask)
+	c.shards = make([]rehash.Shard, shardCount)
+	for i := range c.shards {
+		c.shards[i] = newShard(factory(), perShardMax, c.observer)
+	}
+	c.mask = uint32(shardCount - 1)
+	return nil
+}
+
+// IsRehashing reports whether a rehash is in progress.
+func (c *Cache) IsRehashing() bool {
+	return c.rehasher.IsRehashing()
+}
+
+func (c *Cache) shardIndex(key string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return h.Sum32() & c.mask
+}
+
+func (c *Cache) getShard(key string) *shard {
+	c.mu.RLock()
+	s := c.shards[c.shardIndex(key)].(*shard)
+	c.mu.RUnlock()
+	return s
+}
+
+// Set stores value under key with optional TTL override (0 = use default, <0 = no expiry).
+func (c *Cache) Set(key string, value []byte, ttl ...time.Duration) error {
+	if err := c.validateOpen(); err != nil {
+		return err
+	}
+	if err := validateKeyValue(key, value); err != nil {
+		return err
+	}
+	var d time.Duration
+	if len(ttl) > 0 {
+		d = max(ttl[0], 0)
+	} else {
+		d = c.opts.defaultTTL
+	}
+	evicted := c.getShard(key).Set(key, value, d)
+	c.observer.OnSet(key)
+	for _, ek := range evicted {
+		c.observer.OnEvict(ek)
+	}
+
+	if c.rehasher.IsRehashing() {
+		if oldShard := c.rehasher.OldShard(key); oldShard != nil {
+			oldShard.Del(key)
+		}
+	}
+
+	_, justCompleted := c.rehasher.Step(c.shards, c.shardIndex)
+	if justCompleted {
+		c.observer.OnRehashDone()
+	}
+	return nil
+}
+
+// Get retrieves a value by key.
+func (c *Cache) Get(key string) ([]byte, error) {
+	if err := c.validateOpen(); err != nil {
+		return nil, err
+	}
+	if key == "" {
+		return nil, ErrKeyEmpty
+	}
+	val, ok := c.getShard(key).get(key)
+	if ok {
+		c.observer.OnHit(key)
+		_, justCompleted := c.rehasher.Step(c.shards, c.shardIndex)
+		if justCompleted {
+			c.observer.OnRehashDone()
+		}
+		return val, nil
+	}
+
+	if c.rehasher.IsRehashing() {
+		if oldShard := c.rehasher.OldShard(key); oldShard != nil {
+			val, ok = oldShard.(*shard).get(key)
+			if ok {
+				c.observer.OnHit(key)
+				_, justCompleted := c.rehasher.Step(c.shards, c.shardIndex)
+				if justCompleted {
+					c.observer.OnRehashDone()
+				}
+				return val, nil
+			}
+		}
+	}
+
+	c.observer.OnMiss(key)
+	_, justCompleted := c.rehasher.Step(c.shards, c.shardIndex)
+	if justCompleted {
+		c.observer.OnRehashDone()
+	}
+	return nil, ErrKeyNotFound
+}
+
+// Del removes a key from the cache.
+func (c *Cache) Del(key string) error {
+	if err := c.validateOpen(); err != nil {
+		return err
+	}
+	if key == "" {
+		return ErrKeyEmpty
+	}
+	c.getShard(key).Del(key)
+	c.observer.OnDel(key)
+
+	if c.rehasher.IsRehashing() {
+		if oldShard := c.rehasher.OldShard(key); oldShard != nil {
+			oldShard.Del(key)
+		}
+	}
+
+	_, justCompleted := c.rehasher.Step(c.shards, c.shardIndex)
+	if justCompleted {
+		c.observer.OnRehashDone()
+	}
+	return nil
+}
+
+// Len returns the total number of active entries across all shards.
+func (c *Cache) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed {
+		return 0
+	}
+	total := 0
+	for _, s := range c.shards {
+		total += s.Len()
+	}
+	for _, s := range c.rehasher.OldShards() {
+		total += s.Len()
+	}
+	return total
+}
+
+// Close shuts down the cache.
+func (c *Cache) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrCacheClosed
+	}
+	c.closed = true
+	c.shards = nil
+	c.rehasher.Stop()
+	return nil
+}
+
+// SetObserver replaces the current CacheObserver at runtime.
+func (c *Cache) SetObserver(obs CacheObserver) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if obs == nil {
+		obs = &noopObserver{}
+	}
+	c.observer = obs
+	// Update observer in all active shards
+	for _, s := range c.shards {
+		s.(*shard).observer = obs
+	}
+	// Update observer in old shards (during rehash)
+	for _, s := range c.rehasher.OldShards() {
+		if s != nil {
+			s.(*shard).observer = obs
+		}
+	}
+}
+
+// Cleanup removes all expired entries and returns count removed.
+func (c *Cache) Cleanup() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed {
+		return 0
+	}
+	total := 0
+	for _, s := range c.shards {
+		total += s.(*shard).cleanup()
+	}
+	for _, s := range c.rehasher.OldShards() {
+		total += s.(*shard).cleanup()
+	}
+	return total
+}
+
+// --- Set operations ---
+
+// SAdd adds elements to the set at key. Creates the set if it doesn't exist.
+func (c *Cache) SAdd(key string, elems ...string) (int, error) {
+	if err := c.validateOpen(); err != nil {
+		return 0, err
+	}
+	if key == "" {
+		return 0, ErrKeyEmpty
+	}
+	return c.getShard(key).sAdd(key, elems...), nil
+}
+
+// SRem removes elements from the set at key.
+func (c *Cache) SRem(key string, elems ...string) (int, error) {
+	if err := c.validateOpen(); err != nil {
+		return 0, err
+	}
+	if key == "" {
+		return 0, ErrKeyEmpty
+	}
+	return c.getShard(key).sRem(key, elems...), nil
+}
+
+// SIsMember tests whether elem is in the set at key.
+func (c *Cache) SIsMember(key, elem string) (bool, error) {
+	if err := c.validateOpen(); err != nil {
+		return false, err
+	}
+	if key == "" {
+		return false, ErrKeyEmpty
+	}
+	return c.getShard(key).sIsMember(key, elem), nil
+}
+
+// SMembers returns all elements in the set at key.
+func (c *Cache) SMembers(key string) ([]string, error) {
+	if err := c.validateOpen(); err != nil {
+		return nil, err
+	}
+	if key == "" {
+		return nil, ErrKeyEmpty
+	}
+	return c.getShard(key).sMembers(key), nil
+}
+
+// SCard returns the number of elements in the set.
+func (c *Cache) SCard(key string) (int, error) {
+	if err := c.validateOpen(); err != nil {
+		return 0, err
+	}
+	if key == "" {
+		return 0, ErrKeyEmpty
+	}
+	return c.getShard(key).sCard(key), nil
+}
+
+// SPop removes and returns a random element from the set.
+func (c *Cache) SPop(key string) (string, error) {
+	if err := c.validateOpen(); err != nil {
+		return "", err
+	}
+	if key == "" {
+		return "", ErrKeyEmpty
+	}
+	elem, ok := c.getShard(key).sPop(key)
+	if !ok {
+		return "", ErrKeyNotFound
+	}
+	return elem, nil
+}
+
+// SRandMember returns random elements from the set.
+func (c *Cache) SRandMember(key string, count int) ([]string, error) {
+	if err := c.validateOpen(); err != nil {
+		return nil, err
+	}
+	if key == "" {
+		return nil, ErrKeyEmpty
+	}
+	return c.getShard(key).sRandMember(key, count), nil
+}
+
+// SUnion returns the union of multiple sets across shards.
+func (c *Cache) SUnion(keys ...string) ([]string, error) {
+	if err := c.validateOpen(); err != nil {
+		return nil, err
+	}
+	sets := make([]*set.Set, 0, len(keys))
+	for _, key := range keys {
+		for _, s := range c.shards {
+			if ss := s.(*shard).getSet(key); ss != nil {
+				sets = append(sets, ss)
+				break
+			}
+		}
+	}
+	if len(sets) == 0 {
+		return nil, nil
+	}
+	return set.Union(sets...).Members(), nil
+}
+
+// SInter returns the intersection of multiple sets.
+func (c *Cache) SInter(keys ...string) ([]string, error) {
+	if err := c.validateOpen(); err != nil {
+		return nil, err
+	}
+	sets := make([]*set.Set, 0, len(keys))
+	for _, key := range keys {
+		found := false
+		for _, s := range c.shards {
+			if ss := s.(*shard).getSet(key); ss != nil {
+				sets = append(sets, ss)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, nil // one missing → empty intersection
+		}
+	}
+	return set.Inter(sets...).Members(), nil
+}
+
+// SDiff returns elements in first key not in any other key.
+func (c *Cache) SDiff(keys ...string) ([]string, error) {
+	if err := c.validateOpen(); err != nil {
+		return nil, err
+	}
+	sets := make([]*set.Set, 0, len(keys))
+	for _, key := range keys {
+		found := false
+		for _, s := range c.shards {
+			if ss := s.(*shard).getSet(key); ss != nil {
+				sets = append(sets, ss)
+				found = true
+				break
+			}
+		}
+		if !found {
+			sets = append(sets, set.New()) // missing set = empty
+		}
+	}
+	return set.Diff(sets...).Members(), nil
+}
+
+func (c *Cache) validateOpen() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed {
+		return ErrCacheClosed
+	}
+	return nil
+}
+
+func validateKeyValue(key string, value []byte) error {
+	if key == "" {
+		return ErrKeyEmpty
+	}
+	if value == nil {
+		return ErrValueNil
+	}
+	return nil
+}

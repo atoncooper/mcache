@@ -1,0 +1,33 @@
+# Build output
+bin/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code
+.claude/
+
+# Logs
+logs/
+*.log
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Local config
+config.local.yaml
+
+# Tests
+tests/
+
+# Docs (not needed in image)
+docs/
+
+# Makefile (not needed in image)
+Makefile

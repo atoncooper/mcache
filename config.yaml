@@ -1,0 +1,95 @@
+# mcache 配置文件
+
+# --- 缓存核心 ---
+cache:
+  shards: 16                # 分片数，必须是 2 的幂
+  max_size: 10000           # 全局最大条目数，0 = 无限制
+  default_ttl: "1h"         # 默认 TTL，支持 s/m/h 后缀
+  eviction_policy: lru      # 淘汰策略：noop / lru / lfu
+  rehasher: incremental     # Rehash 策略：incremental / batch / noop
+  cleanup_interval: "10m"   # 定期清理过期条目间隔
+  observer_enabled: true     # 启用缓存事件日志（hit/miss/set/del/evict/rehash）
+
+# --- TCP 服务端 ---
+server:
+  address: ":11211"                 # 监听地址
+  workers: 256                      # 固定 worker goroutine 数
+  max_conns: 100000                 # 最大并发连接数
+  read_timeout: "30s"               # 帧读取超时
+  write_timeout: "5s"               # 响应写入超时
+  graceful_shutdown_timeout: "30s"  # 优雅关闭等待
+
+  # TLS（预留）
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+
+  # 认证（预留）
+  auth:
+    enabled: false
+    token: ""
+
+  # 日志
+  logging:
+    level: info          # debug / info / warn / error
+    format: text         # text / json
+    output: stdout       # stdout / 文件路径（如 logs/mcache.log）
+
+  # Prometheus 指标（预留）
+  metrics:
+    enabled: false
+    address: ":9090"
+
+# --- 系统监控 ---
+monitor:
+  enabled: false
+  interval: "5s"          # 采集间隔
+  capacity: 60            # 环形缓冲区容量（保留最近 N 个快照）
+
+# --- 集群 ---
+cluster:
+  mode: standalone        # standalone / shard / sentinel / master_slave
+  nodes:
+    - "127.0.0.1:11211"
+    - "127.0.0.1:11212"
+  replication_factor: 1
+
+# --- SDK 客户端默认值 ---
+client:
+  pool_size: 4
+  dial_timeout: "5s"
+  read_timeout: "10s"
+  write_timeout: "5s"
+
+# --- MBR 智能决策引擎 ---
+mbr:
+  enabled: false                # 是否启用 MBR（true 开启）
+
+  matrix_capacity: 60           # 特征矩阵窗口数（60 × 500ms = 30s 历史）
+  decision_interval: "500ms"    # 决策循环间隔
+  setpoint: 0.60                # PID 目标内存使用率
+
+  # PID 控制器参数
+  pid:
+    kp: 1.0                     # 比例系数
+    ki: 0.1                     # 积分系数
+    kd: 0.05                    # 微分系数
+
+  # 打分卡权重（总和应为 1.0）
+  weights:
+    mem_growth: 0.35            # 内存增长权重
+    hit_rate: 0.25              # 命中率权重（命中率低 → 分高 → 倾向迁移）
+    new_keys: 0.20              # 新 key 权重
+    eviction_pressure: 0.15     # 淘汰压力权重
+    buffer_penalty: 0.05        # 缓冲区惩罚权重
+
+  # 增量迁移执行器
+  migration:
+    check_interval: "100ms"             # 迁移进度检查间隔
+    max_migration_time: "5m"            # 最大迁移时长（超时强制完成）
+    pause_on_cpu_threshold: 0.80        # CPU 超过 80% 暂停迁移
+    pause_on_mem_threshold: 0.85        # 内存超过 85% 暂停迁移
+    target_load_per_shard: 512          # 每 shard 目标 key 数
+    min_shards: 4                       # 最小 shard 数
+    max_shards: 1024                    # 最大 shard 数
