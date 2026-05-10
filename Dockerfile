@@ -27,8 +27,14 @@ RUN adduser -D -H mcache && \
 
 COPY --from=builder /build/mcache /usr/local/bin/mcache
 
+# Default config (override via volume mount or env)
+COPY config.yaml /etc/mcache/config.yaml
+
 USER mcache
 EXPOSE 11211
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+    CMD mcache ping 2>/dev/null || exit 1
 
 ENTRYPOINT ["mcache"]
 CMD ["server", "--config", "/etc/mcache/config.yaml"]

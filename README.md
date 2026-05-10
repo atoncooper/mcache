@@ -72,6 +72,16 @@ make build-all  # → 全平台交叉编译
 
 > 需要 Go 1.24.3+。
 
+**Docker（无需安装 Go）**
+
+```bash
+docker run -d --name mcache -p 11211:11211 atoncooper/mcache:latest
+docker exec mcache mcache ping
+# PONG
+```
+
+详见 [Docker 部署指南](docs/docker.md)。
+
 ## 运行服务
 
 ### 1. 配置文件
@@ -397,6 +407,7 @@ server:
 | [MBR 决策引擎](docs/mbr.md) | PID 自适应调度：迁移 vs 淘汰 |
 | [Raft 共识](docs/raft.md) | Raft 共识模块 |
 | [数据结构](docs/set.md) | Set / Hash / List 数据结构实现参考 |
+| [Docker 部署](docs/docker.md) | 构建、运行、发布到 Docker Hub |
 | [扩展接口](docs/extending.md) | 自定义淘汰策略、Rehash 策略和编解码 |
 
 ## 测试

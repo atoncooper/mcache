@@ -1,0 +1,38 @@
+services:
+  mcache:
+    build: .
+    image: atoncooper/mcache:latest
+    container_name: mcache
+    ports:
+      - "11211:11211"
+      - "9090:9090"
+    volumes:
+      # Mount custom config (optional — image has defaults)
+      - ./config.yaml:/etc/mcache/config.yaml:ro
+      # Persistent logs
+      - mcache_logs:/var/log/mcache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mcache", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Prometheus for metrics scraping
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mcache-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    profiles: [monitoring]
+
+volumes:
+  mcache_logs:
