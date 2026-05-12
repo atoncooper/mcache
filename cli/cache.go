@@ -142,7 +142,7 @@ var cleanupCmd = &cobra.Command{
 }
 
 func init() {
-	setCmd.Flags().DurationVar(&setTTL, "ttl", 0, "time-to-live (e.g. 5m, 1h)")
+	setCmd.Flags().DurationVar(&setTTL, "ttl", 0, "TTL duration (e.g. 30s, 5m, 1h, 1h30m)")
 
 	rootCmd.AddCommand(getCmd)
 	rootCmd.AddCommand(setCmd)
