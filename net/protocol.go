@@ -78,6 +78,7 @@ const (
 	CmdDel
 	CmdLen
 	CmdCleanup
+	CmdStats // return process-level server statistics (JSON)
 )
 
 // Set commands (extension to the KV protocol).

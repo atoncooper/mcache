@@ -138,6 +138,11 @@ func (c *Client) Cleanup() (int, error) {
 	return c.pickConn().cleanupCmd(c.readTimeout, c.writeTimeout)
 }
 
+// Stats retrieves process-level server statistics as JSON bytes.
+func (c *Client) Stats() ([]byte, error) {
+	return c.pickConn().statsCmd(c.readTimeout, c.writeTimeout)
+}
+
 // Close closes the client and all pooled connections.
 func (c *Client) Close() error {
 	for _, cc := range c.conns {
@@ -156,7 +161,7 @@ func (cc *clientConn) get(key string, readTimeout, writeTimeout time.Duration) (
 		return nil, mcache.ErrKeyNotFound
 	}
 	if resp.Status != StatusOK {
-		return nil, errorString(resp.ErrMsg)
+		return nil, serverError(resp.ErrMsg)
 	}
 	return resp.Value, nil
 }
@@ -171,7 +176,7 @@ func (cc *clientConn) set(key string, value []byte, ttl time.Duration, readTimeo
 		return err
 	}
 	if resp.Status != StatusOK {
-		return errorString(resp.ErrMsg)
+		return serverError(resp.ErrMsg)
 	}
 	return nil
 }
@@ -183,7 +188,7 @@ func (cc *clientConn) del(key string, readTimeout, writeTimeout time.Duration) e
 		return err
 	}
 	if resp.Status != StatusOK {
-		return errorString(resp.ErrMsg)
+		return serverError(resp.ErrMsg)
 	}
 	return nil
 }
@@ -195,7 +200,7 @@ func (cc *clientConn) lenCmd(readTimeout, writeTimeout time.Duration) (int, erro
 		return 0, err
 	}
 	if resp.Status != StatusOK {
-		return 0, errorString(resp.ErrMsg)
+		return 0, serverError(resp.ErrMsg)
 	}
 	if len(resp.Value) < 8 {
 		return 0, ErrBadResponse
@@ -210,12 +215,24 @@ func (cc *clientConn) cleanupCmd(readTimeout, writeTimeout time.Duration) (int, 
 		return 0, err
 	}
 	if resp.Status != StatusOK {
-		return 0, errorString(resp.ErrMsg)
+		return 0, serverError(resp.ErrMsg)
 	}
 	if len(resp.Value) < 8 {
 		return 0, ErrBadResponse
 	}
 	return int(binary.BigEndian.Uint64(resp.Value)), nil
+}
+
+func (cc *clientConn) statsCmd(readTimeout, writeTimeout time.Duration) ([]byte, error) {
+	req := &Request{Cmd: CmdStats}
+	resp, err := cc.do(req, readTimeout, writeTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Status != StatusOK {
+		return nil, serverError(resp.ErrMsg)
+	}
+	return resp.Value, nil
 }
 
 func (cc *clientConn) do(req *Request, readTimeout, writeTimeout time.Duration) (*Response, error) {
@@ -446,11 +463,6 @@ func (cc *clientConn) doSet(req *SetRequest, readTimeout, writeTimeout time.Dura
 	}
 
 	respCh := make(chan *SetResponse, 1)
-	type pendingEntry struct {
-		ch     chan *SetResponse
-		isSet  bool
-	}
-	// Reuse pending map with a union holder
 	cc.pendingMu.Lock()
 	cc.pendingSet[streamID] = respCh
 	cc.pendingMu.Unlock()
@@ -495,7 +507,7 @@ func (cc *clientConn) sAdd(key string, readTimeout, writeTimeout time.Duration, 
 		return 0, err
 	}
 	if resp.Status != StatusOK {
-		return 0, errorString(resp.ErrMsg)
+		return 0, serverError(resp.ErrMsg)
 	}
 	return int(resp.Changed), nil
 }
@@ -506,7 +518,7 @@ func (cc *clientConn) sRem(key string, readTimeout, writeTimeout time.Duration, 
 		return 0, err
 	}
 	if resp.Status != StatusOK {
-		return 0, errorString(resp.ErrMsg)
+		return 0, serverError(resp.ErrMsg)
 	}
 	return int(resp.Changed), nil
 }
@@ -517,7 +529,7 @@ func (cc *clientConn) sIsMember(key, elem string, readTimeout, writeTimeout time
 		return false, err
 	}
 	if resp.Status != StatusOK {
-		return false, errorString(resp.ErrMsg)
+		return false, serverError(resp.ErrMsg)
 	}
 	return resp.IsMember, nil
 }
@@ -528,7 +540,7 @@ func (cc *clientConn) sMembers(key string, readTimeout, writeTimeout time.Durati
 		return nil, err
 	}
 	if resp.Status != StatusOK {
-		return nil, errorString(resp.ErrMsg)
+		return nil, serverError(resp.ErrMsg)
 	}
 	return resp.Elems, nil
 }
@@ -539,7 +551,7 @@ func (cc *clientConn) sCard(key string, readTimeout, writeTimeout time.Duration)
 		return 0, err
 	}
 	if resp.Status != StatusOK {
-		return 0, errorString(resp.ErrMsg)
+		return 0, serverError(resp.ErrMsg)
 	}
 	return int(resp.Card), nil
 }
@@ -553,7 +565,7 @@ func (cc *clientConn) sPop(key string, readTimeout, writeTimeout time.Duration) 
 		return "", mcache.ErrKeyNotFound
 	}
 	if resp.Status != StatusOK {
-		return "", errorString(resp.ErrMsg)
+		return "", serverError(resp.ErrMsg)
 	}
 	if len(resp.Elems) > 0 {
 		return resp.Elems[0], nil
@@ -567,7 +579,7 @@ func (cc *clientConn) sRandMember(key string, count int, readTimeout, writeTimeo
 		return nil, err
 	}
 	if resp.Status != StatusOK {
-		return nil, errorString(resp.ErrMsg)
+		return nil, serverError(resp.ErrMsg)
 	}
 	return resp.Elems, nil
 }
@@ -578,7 +590,7 @@ func (cc *clientConn) sUnion(readTimeout, writeTimeout time.Duration, keys ...st
 		return nil, err
 	}
 	if resp.Status != StatusOK {
-		return nil, errorString(resp.ErrMsg)
+		return nil, serverError(resp.ErrMsg)
 	}
 	return resp.Elems, nil
 }
@@ -589,7 +601,7 @@ func (cc *clientConn) sInter(readTimeout, writeTimeout time.Duration, keys ...st
 		return nil, err
 	}
 	if resp.Status != StatusOK {
-		return nil, errorString(resp.ErrMsg)
+		return nil, serverError(resp.ErrMsg)
 	}
 	return resp.Elems, nil
 }
@@ -600,7 +612,7 @@ func (cc *clientConn) sDiff(readTimeout, writeTimeout time.Duration, keys ...str
 		return nil, err
 	}
 	if resp.Status != StatusOK {
-		return nil, errorString(resp.ErrMsg)
+		return nil, serverError(resp.ErrMsg)
 	}
 	return resp.Elems, nil
 }
@@ -609,6 +621,13 @@ func (cc *clientConn) close() {
 	cc.closed.Store(true)
 	cc.netConn.Close()
 	cc.closeAllPending(ErrConnClosed)
+}
+
+func serverError(msg string) error {
+	if msg == "not leader" {
+		return ErrNotLeader
+	}
+	return errorString(msg)
 }
 
 type errorString string

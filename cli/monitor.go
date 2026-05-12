@@ -1,105 +1,109 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"runtime"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/atoncooper/mcache/monitor"
+	mnet "github.com/atoncooper/mcache/net"
 )
+
+var monitorWatch time.Duration
 
 var monitorCmd = &cobra.Command{
 	Use:   "monitor",
-	Short: "Show current system resource usage",
-	Long: `Collect and display a one-shot snapshot of system resource usage
-including CPU, memory, disk I/O, and network statistics.`,
+	Short: "Show server process resource usage",
+	Long: `Display a one-shot snapshot of the mcache server's process-level
+resource usage including memory, goroutines, network I/O, and cache stats.
+Use --watch to refresh continuously.`,
 	Args: cobra.NoArgs,
 	Run: func(cmd *cobra.Command, args []string) {
-		collectors := []monitor.Collector{monitor.NewRuntime()}
-		proc := monitor.NewProc()
-		if _, err := proc.Collect(); err == nil {
-			collectors = append(collectors, proc)
+		if monitorWatch > 0 {
+			ticker := time.NewTicker(monitorWatch)
+			defer ticker.Stop()
+			for {
+				printMonitor()
+				fmt.Println(strings.Repeat("-", 50))
+				<-ticker.C
+			}
+		} else {
+			printMonitor()
 		}
-
-		snap := &monitor.SystemSnapshot{}
-		for _, c := range collectors {
-			partial, err := c.Collect()
-			if err != nil {
-				continue
-			}
-			if partial.CPU != nil {
-				snap.CPU = partial.CPU
-			}
-			if partial.Memory != nil {
-				snap.Memory = partial.Memory
-			}
-			snap.IO = append(snap.IO, partial.IO...)
-			snap.Network = append(snap.Network, partial.Network...)
-		}
-
-		printMonitorSnapshot(snap)
 	},
 }
 
 func init() {
+	monitorCmd.Flags().DurationVarP(&monitorWatch, "watch", "w", 0, "refresh interval (e.g. 2s, 5s)")
 	rootCmd.AddCommand(monitorCmd)
 }
 
-func printMonitorSnapshot(snap *monitor.SystemSnapshot) {
-	fmt.Println("=== System Resource Monitor ===")
+func printMonitor() {
+	client, err := newCmdClient()
+	if err != nil {
+		exitError("%v", err)
+	}
+	defer client.Close()
+
+	data, err := client.Stats()
+	if err != nil {
+		exitError("%v", err)
+	}
+
+	var stats mnet.ServerStats
+	if err := json.Unmarshal(data, &stats); err != nil {
+		exitError("decode stats: %v", err)
+	}
+
+	uptime := time.Duration(stats.UptimeMs) * time.Millisecond
+
+	fmt.Println("=== mcache Process Monitor ===")
+	fmt.Printf("Uptime:      %s\n", uptime.Round(time.Second))
+	fmt.Printf("Go Version:  %s %s/%s\n", stats.GoVersion, stats.OS, stats.Arch)
 	fmt.Println()
 
-	if snap.CPU != nil {
-		fmt.Println("CPU:")
-		fmt.Printf("  Cores:        %d\n", snap.CPU.CoreCount)
-		if snap.CPU.UsagePercent > 0 {
-			fmt.Printf("  Usage:        %.2f%%\n", snap.CPU.UsagePercent)
-		}
-		if snap.CPU.LoadAvg1 > 0 || snap.CPU.LoadAvg5 > 0 || snap.CPU.LoadAvg15 > 0 {
-			fmt.Printf("  Load Avg:     %.2f / %.2f / %.2f\n", snap.CPU.LoadAvg1, snap.CPU.LoadAvg5, snap.CPU.LoadAvg15)
-		}
-		fmt.Println()
+	// Memory section
+	fmt.Println("Memory:")
+	if stats.MemoryLimit > 0 {
+		pct := float64(stats.CacheMemory) / float64(stats.MemoryLimit) * 100
+		bar := renderBar(pct, 20)
+		fmt.Printf("  Heap Used:    %s / %s  %s  %.1f%%\n",
+			humanBytes(stats.CacheMemory), humanBytes(stats.MemoryLimit), bar, pct)
+	} else {
+		fmt.Printf("  Heap Used:    %s (no limit set)\n", humanBytes(stats.CacheMemory))
 	}
+	fmt.Printf("  Goroutines:   %d\n", stats.Goroutines)
+	fmt.Println()
 
-	if snap.Memory != nil {
-		fmt.Println("Memory:")
-		fmt.Printf("  Total:        %s\n", humanBytes(snap.Memory.Total))
-		fmt.Printf("  Used:         %s (%.2f%%)\n", humanBytes(snap.Memory.Used), snap.Memory.UsedPercent)
-		fmt.Printf("  Free:         %s\n", humanBytes(snap.Memory.Free))
-		fmt.Println()
+	// Cache section
+	fmt.Println("Cache:")
+	fmt.Printf("  Entries:      %d\n", stats.CacheEntries)
+	fmt.Println()
+
+	// Network I/O section
+	fmt.Println("Network I/O:")
+	fmt.Printf("  Connections:  %d (peak %d)\n", stats.Connections, stats.PeakConns)
+	fmt.Printf("  Requests:     %d total\n", stats.TotalRequests)
+	fmt.Printf("  Bytes Read:   %s\n", humanBytes(stats.BytesRead))
+	fmt.Printf("  Bytes Written:%s\n", humanBytes(stats.BytesWritten))
+	if stats.UptimeMs > 0 {
+		secs := float64(stats.UptimeMs) / 1000.0
+		fmt.Printf("  Read Rate:    %s/s\n", humanBytes(uint64(float64(stats.BytesRead)/secs)))
+		fmt.Printf("  Write Rate:   %s/s\n", humanBytes(uint64(float64(stats.BytesWritten)/secs)))
+		fmt.Printf("  Req Rate:     %.1f/s\n", float64(stats.TotalRequests)/secs)
 	}
+	fmt.Println()
 
-	if len(snap.IO) > 0 {
-		fmt.Println("Disk I/O:")
-		for _, io := range snap.IO {
-			fmt.Printf("  %-12s  read: %s/s  write: %s/s  ops: %d/%d\n",
-				io.Device,
-				humanBytes(uint64(io.ReadBytesRate)),
-				humanBytes(uint64(io.WriteBytesRate)),
-				io.ReadOps,
-				io.WriteOps,
-			)
-		}
-		fmt.Println()
-	}
-
-	if len(snap.Network) > 0 {
-		fmt.Println("Network:")
-		for _, net := range snap.Network {
-			fmt.Printf("  %-12s  recv: %s/s  sent: %s/s  pkts: %d/%d\n",
-				net.Interface,
-				humanBytes(uint64(net.RecvRate)),
-				humanBytes(uint64(net.SendRate)),
-				net.PacketsRecv,
-				net.PacketsSent,
-			)
-		}
-		fmt.Println()
-	}
-
-	fmt.Printf("Go Runtime: %s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
-	fmt.Printf("GoRoutines: %d\n", runtime.NumGoroutine())
+	// Local CLI process info
+	var localMS runtime.MemStats
+	runtime.ReadMemStats(&localMS)
+	fmt.Println("CLI Process (local):")
+	fmt.Printf("  Heap Used:    %s\n", humanBytes(localMS.Alloc))
+	fmt.Printf("  Heap Sys:     %s\n", humanBytes(localMS.Sys))
+	fmt.Printf("  Goroutines:   %d\n", runtime.NumGoroutine())
 }
 
 func humanBytes(b uint64) string {
@@ -113,4 +117,20 @@ func humanBytes(b uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.2f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// renderBar draws an ASCII progress bar of width blocks.
+func renderBar(percent float64, width int) string {
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	filled := int(percent / 100 * float64(width))
+	if filled > width {
+		filled = width
+	}
+	empty := width - filled
+	return "[" + strings.Repeat("=", filled) + strings.Repeat("-", empty) + "]"
 }

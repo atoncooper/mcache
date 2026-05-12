@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -91,6 +92,7 @@ On Windows, use Docker or Start-Process to background the server.`,
 		}
 		writeTimeout, _ := time.ParseDuration(cfg.Server.WriteTimeout)
 		gracefulTimeout, _ := time.ParseDuration(cfg.Server.GracefulShutdownTimeout)
+		memLimit := parseMemoryLimit(cfg.Server.MemoryLimit)
 
 		srv := mnet.NewServer(c,
 			mnet.WithWorkers(cfg.Server.Workers),
@@ -98,6 +100,7 @@ On Windows, use Docker or Start-Process to background the server.`,
 			mnet.WithReadTimeout(readTimeout),
 			mnet.WithWriteTimeout(writeTimeout),
 			mnet.WithGracefulShutdownTimeout(gracefulTimeout),
+			mnet.WithMemoryLimit(memLimit),
 			mnet.WithErrorLog(func(format string, v ...any) {
 				logger.Error(fmt.Sprintf(format, v...), nil)
 			}),
@@ -105,6 +108,23 @@ On Windows, use Docker or Start-Process to background the server.`,
 				logger.Info(fmt.Sprintf(format, v...), nil)
 			}),
 		)
+
+		// Initialise Raft if enabled.
+		if cfg.Raft.Enabled {
+			peers := make(map[uint64]string, len(cfg.Raft.Peers))
+			for _, p := range cfg.Raft.Peers {
+				peers[p.ID] = p.Addr
+			}
+			if err := srv.InitRaft(cfg.Raft.NodeID, cfg.Raft.BindAddr, peers); err != nil {
+				logger.Error("raft init", map[string]any{"error": err.Error()})
+				os.Exit(1)
+			}
+			logger.Info("raft initialised", map[string]any{
+				"node_id":   cfg.Raft.NodeID,
+				"bind_addr": cfg.Raft.BindAddr,
+				"peers":     peers,
+			})
+		}
 
 		go func() {
 			logger.Info("server listening", map[string]any{"address": cfg.Server.Address})
@@ -237,4 +257,48 @@ func startMBR(c *mcache.Cache, cfg *mcache.Config, logger infra.Logger) {
 		"interval":        mbrOpts.DecisionInterval.String(),
 		"setpoint":        mbrOpts.PID.Setpoint,
 	})
+}
+
+// parseMemoryLimit converts a human-readable string like "500MB" or "1.5GB" to bytes.
+// Returns 0 for empty/invalid input.
+func parseMemoryLimit(s string) uint64 {
+	if s == "" {
+		return 0
+	}
+	s = strings.TrimSpace(strings.ToUpper(s))
+	var multiplier uint64 = 1
+	switch {
+	case strings.HasSuffix(s, "TB"):
+		multiplier = 1 << 40
+		s = strings.TrimSuffix(s, "TB")
+	case strings.HasSuffix(s, "GB"):
+		multiplier = 1 << 30
+		s = strings.TrimSuffix(s, "GB")
+	case strings.HasSuffix(s, "MB"):
+		multiplier = 1 << 20
+		s = strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "KB"):
+		multiplier = 1 << 10
+		s = strings.TrimSuffix(s, "KB")
+	case strings.HasSuffix(s, "TIB"):
+		multiplier = 1 << 40
+		s = strings.TrimSuffix(s, "TIB")
+	case strings.HasSuffix(s, "GIB"):
+		multiplier = 1 << 30
+		s = strings.TrimSuffix(s, "GIB")
+	case strings.HasSuffix(s, "MIB"):
+		multiplier = 1 << 20
+		s = strings.TrimSuffix(s, "MIB")
+	case strings.HasSuffix(s, "KIB"):
+		multiplier = 1 << 10
+		s = strings.TrimSuffix(s, "KIB")
+	case strings.HasSuffix(s, "B"):
+		s = strings.TrimSuffix(s, "B")
+	}
+	s = strings.TrimSpace(s)
+	var val float64
+	if _, err := fmt.Sscanf(s, "%f", &val); err != nil {
+		return 0
+	}
+	return uint64(val * float64(multiplier))
 }
