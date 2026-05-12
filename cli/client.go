@@ -1,18 +1,22 @@
 package cli
 
 import (
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/atoncooper/mcache/cluster"
 	mnet "github.com/atoncooper/mcache/net"
+	"gopkg.in/yaml.v3"
 )
 
 var (
-	globalAddr    string
-	globalTimeout time.Duration
-	globalPool    int
-	clusterCfg    cluster.Options
-	useCluster    bool
+	globalAddr        string
+	globalTimeout     time.Duration
+	globalPool        int
+	clusterConfigPath string
+	clusterCfg        cluster.Options
+	useCluster        bool
 )
 
 // EnableCluster sets the cluster configuration and switches the CLI to
@@ -23,8 +27,17 @@ func EnableCluster(opts cluster.Options) {
 }
 
 // newCmdClient returns a client that transparently uses either a direct
-// connection or a cluster manager depending on whether EnableCluster was called.
+// connection or a cluster manager depending on whether EnableCluster was called
+// or --cluster-config is provided.
 func newCmdClient() (*cmdClient, error) {
+	// Load cluster config from file if specified.
+	if clusterConfigPath != "" {
+		if err := loadClusterConfig(clusterConfigPath); err != nil {
+			return nil, err
+		}
+		useCluster = true
+	}
+
 	direct, err := mnet.NewClient(globalAddr,
 		mnet.WithPoolSize(globalPool),
 		mnet.WithDialTimeout(globalTimeout),
@@ -56,6 +69,57 @@ func newCmdClient() (*cmdClient, error) {
 	}
 
 	return cc, nil
+}
+
+// loadClusterConfig reads a YAML cluster configuration file.
+func loadClusterConfig(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read cluster config: %w", err)
+	}
+	var cfg clusterFileConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parse cluster config: %w", err)
+	}
+
+	clusterCfg.Mode = cfg.Mode
+	clusterCfg.Master = cfg.Master
+	clusterCfg.Sentinels = cfg.Sentinels
+	clusterCfg.Slaves = cfg.Slaves
+	for _, n := range cfg.Nodes {
+		clusterCfg.Nodes = append(clusterCfg.Nodes, cluster.NodeConfig{
+			Addr:     n.Addr,
+			Weight:   n.Weight,
+			IsMaster: n.IsMaster,
+		})
+	}
+	if d, err := time.ParseDuration(cfg.HealthCheckInterval); err == nil && d > 0 {
+		clusterCfg.HealthCheckInterval = d
+	}
+	if d, err := time.ParseDuration(cfg.HealthCheckTimeout); err == nil && d > 0 {
+		clusterCfg.HealthCheckTimeout = d
+	}
+	if d, err := time.ParseDuration(cfg.FailoverTimeout); err == nil && d > 0 {
+		clusterCfg.FailoverTimeout = d
+	}
+	return nil
+}
+
+type clusterFileConfig struct {
+	Mode                string              `yaml:"mode"`
+	Nodes               []clusterNodeConfig `yaml:"nodes"`
+	Sentinels           []string            `yaml:"sentinels"`
+	Master              string              `yaml:"master"`
+	Slaves              []string            `yaml:"slaves"`
+	HealthCheckInterval string              `yaml:"health_check_interval"`
+	HealthCheckTimeout  string              `yaml:"health_check_timeout"`
+	FailoverTimeout     string              `yaml:"failover_timeout"`
+}
+
+type clusterNodeConfig struct {
+	Addr     string `yaml:"addr"`
+	Weight   int    `yaml:"weight"`
+	IsMaster bool   `yaml:"is_master"`
 }
 
 func newClient() (*mnet.Client, error) {
@@ -111,6 +175,7 @@ func (c *cmdClient) Len() (int, error) {
 }
 
 func (c *cmdClient) Cleanup() (int, error) { return c.direct.Cleanup() }
+func (c *cmdClient) Stats() ([]byte, error) { return c.direct.Stats() }
 
 // --- Hash ---
 

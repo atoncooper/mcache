@@ -60,6 +60,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&globalAddr, "addr", "a", "127.0.0.1:11211", "mcache server address")
 	rootCmd.PersistentFlags().DurationVarP(&globalTimeout, "timeout", "t", 10*time.Second, "operation timeout")
 	rootCmd.PersistentFlags().IntVar(&globalPool, "pool", 4, "connection pool size")
+	rootCmd.PersistentFlags().StringVar(&clusterConfigPath, "cluster-config", "", "cluster config file (enables cluster mode)")
 }
 
 func exitError(format string, args ...any) {
