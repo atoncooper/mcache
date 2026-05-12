@@ -180,14 +180,42 @@ def run_mcache(
 ) -> BackendResult:
     """对 mcache 回放 trace，返回结果。"""
     print(f"\n{'─' * 50}")
-    print(f"  [mcache] 预填充 {key_count:,} keys …")
+    prefill_workers = min(num_clients, 64)
+    print(f"  [mcache] 预填充 {key_count:,} keys (并发 {prefill_workers}) …")
+
+    progress = [0]
+    plock = threading.Lock()
+
+    def _prefill_chunk(start: int, end: int) -> None:
+        d = driver_factory()
+        try:
+            for i in range(start, end):
+                d.set(f'__bench__{i}', _make_value(i, value_size))
+                if (i - start) % 1000 == 999:
+                    with plock:
+                        progress[0] += 1000
+                        print(f"    … {progress[0]:,} / {key_count:,} "
+                              f"({progress[0] * 100 // key_count}%)", flush=True)
+        finally:
+            d.close()
+
+    chunk = (key_count + prefill_workers - 1) // prefill_workers
+    pt0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=prefill_workers) as ppool:
+        pfutures = []
+        for w in range(prefill_workers):
+            s = w * chunk
+            e = min(s + chunk, key_count)
+            if s >= e:
+                break
+            pfutures.append(ppool.submit(_prefill_chunk, s, e))
+        for f in pfutures:
+            f.result()
+    pre_elapsed = time.perf_counter() - pt0
 
     driver = driver_factory()
     try:
-        # 预填充
-        for i in range(key_count):
-            driver.set(f'__bench__{i}', _make_value(i, value_size))
-        print(f"  [mcache] 预填充完成，开始回放 {len(trace):,} ops "
+        print(f"  [mcache] 预填充完成 ({pre_elapsed:.1f}s),开始回放 {len(trace):,} ops "
               f"({num_clients} clients) …")
 
         total_ops = len(trace)
@@ -361,9 +389,10 @@ def draw_charts(result: BackendResult, params: dict, output_dir: str) -> None:
 
     # ── 延迟百分位（单组）──
     fig, ax = plt.subplots(figsize=(6, 4))
-    pcts = ['p50', 'p95', 'p99', 'p999']
-    vals = [_pct(lats, float(p[1:])) for p in pcts]
-    bars = ax.bar(pcts, vals, color=color, width=0.5)
+    pcts = [('p50', 50.0), ('p95', 95.0), ('p99', 99.0), ('p999', 99.9)]
+    labels = [name for name, _ in pcts]
+    vals = [_pct(lats, pv) for _, pv in pcts]
+    bars = ax.bar(labels, vals, color=color, width=0.5)
     for b, v in zip(bars, vals):
         ax.text(b.get_x() + b.get_width() / 2, v + max(vals) * 0.02,
                 f'{v:.0f}', ha='center', fontsize=10)
