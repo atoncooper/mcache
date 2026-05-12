@@ -12,9 +12,9 @@ func TestSetRequestEncodeDecode(t *testing.T) {
 		name string
 		req  mnet.SetRequest
 	}{
-		{"SAdd", mnet.SetRequest{Cmd: mnet.CmdSAdd, Key: "myset", Elem: "hello"}},
-		{"SRem", mnet.SetRequest{Cmd: mnet.CmdSRem, Key: "myset", Elem: "hello"}},
-		{"SIsMember", mnet.SetRequest{Cmd: mnet.CmdSIsMember, Key: "myset", Elem: "hello"}},
+		{"SAdd", mnet.SetRequest{Cmd: mnet.CmdSAdd, Key: "myset", Elems: []string{"hello"}}},
+		{"SRem", mnet.SetRequest{Cmd: mnet.CmdSRem, Key: "myset", Elems: []string{"hello"}}},
+		{"SIsMember", mnet.SetRequest{Cmd: mnet.CmdSIsMember, Key: "myset", Elems: []string{"hello"}}},
 		{"SMembers", mnet.SetRequest{Cmd: mnet.CmdSMembers, Key: "myset"}},
 		{"SCard", mnet.SetRequest{Cmd: mnet.CmdSCard, Key: "myset"}},
 		{"SPop", mnet.SetRequest{Cmd: mnet.CmdSPop, Key: "myset"}},
@@ -40,8 +40,8 @@ func TestSetRequestEncodeDecode(t *testing.T) {
 			if decoded.Key != tt.req.Key {
 				t.Errorf("key mismatch: %q != %q", decoded.Key, tt.req.Key)
 			}
-			if tt.req.Elem != "" && decoded.Elem != tt.req.Elem {
-				t.Errorf("elem mismatch: %q != %q", decoded.Elem, tt.req.Elem)
+			if len(tt.req.Elems) > 0 && len(decoded.Elems) > 0 && decoded.Elems[0] != tt.req.Elems[0] {
+				t.Errorf("elem mismatch: %q != %q", decoded.Elems[0], tt.req.Elems[0])
 			}
 			if len(tt.req.Keys) != len(decoded.Keys) {
 				t.Errorf("keys len mismatch: %d != %d", len(tt.req.Keys), len(decoded.Keys))
