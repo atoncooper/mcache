@@ -3,25 +3,74 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mcache"
+name = "mcache-py"
 version = "1.0.0"
-description = "Python SDK for mcache — high-performance in-memory cache"
+description = "Python SDK for mcache — high-performance in-memory cache with KV, Hash, List, Set data structures"
+readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
-authors = [{name = "mcache contributors"}]
-keywords = ["cache", "mcache", "redis-alternative"]
+license = { file = "LICENSE" }
+authors = [
+    { name = "atoncooper", email = "zatoncooper@gmail.com" },
+]
+maintainers = [
+    { name = "atoncooper", email = "zatoncooper@gmail.com" },
+]
+keywords = [
+    "cache",
+    "mcache",
+    "in-memory",
+    "redis-alternative",
+    "kv-store",
+    "distributed-cache",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
 ]
+dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest", "redis"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "redis>=5.0",
+    "build>=1.0",
+    "twine>=4.0",
+]
+bench = [
+    "redis>=5.0",
+    "matplotlib>=3.7",
+    "numpy>=1.24",
+    "psutil>=5.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/atoncooper/mcache"
+Repository = "https://github.com/atoncooper/mcache"
+Documentation = "https://github.com/atoncooper/mcache/tree/master/docs"
+Issues = "https://github.com/atoncooper/mcache/issues"
+Changelog = "https://github.com/atoncooper/mcache/blob/master/sdk/python/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["mcache*"]
+exclude = ["tests*", "scripts*"]
+
+[tool.setuptools.package-data]
+mcache = ["py.typed"]
