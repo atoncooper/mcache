@@ -6,6 +6,8 @@
 - [kv_bench — 公平 KV 对比测试](#kv_bench--公平-kv-对比测试)
 - [run_all — 11 场景全量对比](#run_all--11-场景全量对比)
 - [concurrent_bench — 高并发压力测试](#concurrent_bench--高并发压力测试)
+- [ping — 连通性检测](#ping--连通性检测)
+- [pypi_smoke_test — PyPI 包验证](#pypi_smoke_test--pypi-包验证)
 - [环境变量](#环境变量)
 - [常见问题](#常见问题)
 
@@ -216,6 +218,107 @@ output/concurrent_bench/
 ├── latency_hist.csv
 └── summary.txt
 ```
+
+---
+
+## ping — 连通性检测
+
+`ping.py` 是类似系统 `ping` 的连通性测试工具，但走的是 **mcache 协议的 PING 命令**（而非 ICMP）。脚本会自动加载本地 SDK（`sdk/python/`），**无需 `pip install mcache-py`**。
+
+### 用法
+
+```bash
+# 默认 ping 4 次（127.0.0.1:11211）
+python ping.py
+
+# 持续 ping，Ctrl+C 退出（监控用）
+python ping.py -c 0
+
+# 自定义次数和间隔
+python ping.py -c 100 -i 0.5     # 100 次，每 0.5 秒一次
+
+# 指定远端服务器（短写法 / 长写法等价）
+python ping.py -H 192.168.1.10 -p 11211
+python ping.py --host 10.0.0.1 --port 11211
+
+# 只输出汇总，不打印每条
+python ping.py -c 50 -q
+```
+
+### 参数
+
+| 参数 | 简写 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--host` | `-H` | `127.0.0.1` | mcache 服务器地址 |
+| `--port` | `-p` | `11211` | 端口 |
+| `--count` | `-c` | `4` | ping 次数（`0` = 持续 ping） |
+| `--interval` | `-i` | `1.0` | 间隔秒数 |
+| `--timeout` | `-t` | `3.0` | 单次超时秒数 |
+| `--quiet` | `-q` | | 只输出汇总 |
+
+### 输出示例
+
+```
+PING 127.0.0.1:11211
+icmp_seq=1 time=0.421 ms
+icmp_seq=2 time=0.389 ms
+icmp_seq=3 time=0.412 ms
+icmp_seq=4 time=0.395 ms
+
+--- 127.0.0.1:11211 ping 统计 ---
+4 packets transmitted, 4 received, 0.0% packet loss
+rtt min/avg/max/mdev = 0.389/0.404/0.421/0.013 ms
+```
+
+### 退出码
+
+| 值 | 含义 |
+|---|---|
+| `0` | 至少一次成功 |
+| `1` | 全部超时（服务存活但响应异常） |
+| `2` | 无法建立连接（服务可能未启动） |
+
+可在 shell 脚本中做健康检查：
+
+```bash
+python ping.py -c 1 -q && echo "服务正常" || echo "服务异常"
+```
+
+---
+
+## pypi_smoke_test — PyPI 包验证
+
+`pypi_smoke_test.py` 用于验证从 **PyPI 安装**的 `mcache-py` 包能否正常工作，是发布后端到端的冒烟测试。与其它脚本不同，**它不会从本地 `sdk/python/` 加载**，而是用 `pip` 装的版本。
+
+### 用法
+
+```bash
+# 1. 从 PyPI 安装最新版
+pip install mcache-py
+
+# 2. 启动 mcache 服务（默认 127.0.0.1:11211）
+
+# 3. 运行冒烟测试
+python pypi_smoke_test.py
+
+# 远端服务器
+python pypi_smoke_test.py --addr 192.168.1.10:11211
+```
+
+### 测试覆盖
+
+| 套件 | 验证内容 |
+|------|---------|
+| `test_ping_and_stats` | Ping / Len / Cleanup |
+| `test_kv` | Set / Get / Del / Exists / TTL |
+| `test_hash` | HSet / HGet / HGetAll / HDel / HLen |
+| `test_list` | LPush / RPush / LRange / LPop / LLen |
+| `test_set` | SAdd / SMembers / SIsMember / SRem / SCard |
+
+### 退出码
+
+- `0` — 全部通过
+- `1` — 至少一个套件失败（详情见 `FAILED` 段）
 
 ---
 
