@@ -256,7 +256,7 @@ func (cc *ClusterClient) Persist(key string) (bool, error) {
 func (cc *ClusterClient) Keys(pattern string) ([]string, error) {
 	var all []string
 	for _, node := range cc.nodes {
-		keys, err := node.Keys(pattern)
+		keys, err := node.client.Keys(pattern)
 		if err != nil {
 			return nil, err
 		}

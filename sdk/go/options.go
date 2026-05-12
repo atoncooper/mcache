@@ -59,3 +59,10 @@ func WithCodec(c Codec) Option {
 		o.Codec = c
 	}
 }
+
+// WithAddrs sets multiple server addresses for cluster mode.
+func WithAddrs(addrs ...string) Option {
+	return func(o *Options) {
+		o.Addrs = addrs
+	}
+}
