@@ -446,10 +446,8 @@ func (c *Cache) Keys(pattern string) ([]string, error) {
 		return nil, err
 	}
 	var matched []string
-	c.mu.RLock()
-	for _, s := range c.shards {
+	for _, s := range c.loadShardTable().shards {
 		matched = append(matched, s.(*shard).matchKeys(pattern)...)
 	}
-	c.mu.RUnlock()
 	return matched, nil
 }

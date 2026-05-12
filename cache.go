@@ -4,24 +4,35 @@ import (
 	"errors"
 	"hash/fnv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/atoncooper/mcache/rehash"
 	"github.com/atoncooper/mcache/ds/set"
 )
 
-// Cache is a thread-safe in-memory cache with sharding for reduced lock contention.
-// Supports pluggable rehashing strategies to resize shard count.
-type Cache struct {
+// shardTable is an immutable snapshot of the shard layout.
+// It is stored atomically so the hot path (getShard) can read it
+// without acquiring any locks.
+type shardTable struct {
 	shards []rehash.Shard
 	mask   uint32
+}
+
+// Cache is a thread-safe in-memory cache with sharding for reduced lock contention.
+// Supports pluggable rehashing strategies to resize shard count.
+//
+// `shards` is accessed atomically so the hot path (getShard) can look up a shard
+// without acquiring a lock. `closed` is atomic so validateOpen is also lock-free.
+// `mu` serialises Resize calls and guards observer swaps.
+type Cache struct {
+	shards atomic.Value // *shardTable
 	opts   Options
-	closed bool
-	mu     sync.RWMutex
+	closed atomic.Bool
+	mu     sync.Mutex
 
 	rehasher rehash.Rehasher
 
-	// Eviction policy factory used when creating new shards or swapping at runtime.
 	policyName    string
 	policyFactory PolicyFactory
 	policyMu      sync.RWMutex
@@ -68,9 +79,11 @@ func New(opts Options) (*Cache, error) {
 	if opts.observer == nil {
 		opts.observer = &noopObserver{}
 	}
+	shards := make([]rehash.Shard, opts.shardCount)
+	for i := range shards {
+		shards[i] = newShard(factory(), perShardMax, opts.observer)
+	}
 	c := &Cache{
-		shards:        make([]rehash.Shard, opts.shardCount),
-		mask:          uint32(opts.shardCount - 1),
 		opts:          opts,
 		policyName:    opts.evictionPolicy,
 		policyFactory: factory,
@@ -78,9 +91,10 @@ func New(opts Options) (*Cache, error) {
 		observer:      opts.observer,
 		rehasher:      rFactory(),
 	}
-	for i := range c.shards {
-		c.shards[i] = newShard(factory(), perShardMax, c.observer)
-	}
+	c.shards.Store(&shardTable{
+		shards: shards,
+		mask:   uint32(opts.shardCount - 1),
+	})
 	return c, nil
 }
 
@@ -100,11 +114,10 @@ func (c *Cache) SetEvictionPolicy(name string) error {
 	c.policyFactory = factory
 	c.policyMu.Unlock()
 
-	c.mu.RLock()
-	for _, s := range c.shards {
+	table := c.loadShardTable()
+	for _, s := range table.shards {
 		s.(*shard).swapPolicy(factory())
 	}
-	c.mu.RUnlock()
 
 	for _, s := range c.rehasher.OldShards() {
 		if s != nil {
@@ -153,7 +166,7 @@ func (c *Cache) Resize(shardCount int) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if c.closed.Load() {
 		return ErrCacheClosed
 	}
 	if c.rehasher.IsRehashing() {
@@ -172,13 +185,17 @@ func (c *Cache) Resize(shardCount int) error {
 		}
 	}
 
-	c.observer.OnRehashStart(len(c.shards), shardCount)
-	c.rehasher.Start(c.shards, c.mask)
-	c.shards = make([]rehash.Shard, shardCount)
-	for i := range c.shards {
-		c.shards[i] = newShard(factory(), perShardMax, c.observer)
+	oldTable := c.loadShardTable()
+	c.observer.OnRehashStart(len(oldTable.shards), shardCount)
+	c.rehasher.Start(oldTable.shards, oldTable.mask)
+	newShards := make([]rehash.Shard, shardCount)
+	for i := range newShards {
+		newShards[i] = newShard(factory(), perShardMax, c.observer)
 	}
-	c.mask = uint32(shardCount - 1)
+	c.shards.Store(&shardTable{
+		shards: newShards,
+		mask:   uint32(shardCount - 1),
+	})
 	return nil
 }
 
@@ -187,17 +204,26 @@ func (c *Cache) IsRehashing() bool {
 	return c.rehasher.IsRehashing()
 }
 
+// loadShardTable returns the current shard table atomically.
+func (c *Cache) loadShardTable() *shardTable {
+	return c.shards.Load().(*shardTable)
+}
+
 func (c *Cache) shardIndex(key string) uint32 {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
-	return h.Sum32() & c.mask
+	return h.Sum32() & c.loadShardTable().mask
 }
 
 func (c *Cache) getShard(key string) *shard {
-	c.mu.RLock()
-	s := c.shards[c.shardIndex(key)].(*shard)
-	c.mu.RUnlock()
-	return s
+	table := c.loadShardTable()
+	return table.shards[shardIndexFor(key, table.mask)].(*shard)
+}
+
+func shardIndexFor(key string, mask uint32) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return h.Sum32() & mask
 }
 
 // Set stores value under key with optional TTL override (0 = use default, <0 = no expiry).
@@ -214,7 +240,8 @@ func (c *Cache) Set(key string, value []byte, ttl ...time.Duration) error {
 	} else {
 		d = c.opts.defaultTTL
 	}
-	evicted := c.getShard(key).Set(key, value, d)
+	shard := c.getShard(key)
+	evicted := shard.Set(key, value, d)
 	c.observer.OnSet(key)
 	for _, ek := range evicted {
 		c.observer.OnEvict(ek)
@@ -224,11 +251,11 @@ func (c *Cache) Set(key string, value []byte, ttl ...time.Duration) error {
 		if oldShard := c.rehasher.OldShard(key); oldShard != nil {
 			oldShard.Del(key)
 		}
-	}
-
-	_, justCompleted := c.rehasher.Step(c.shards, c.shardIndex)
-	if justCompleted {
-		c.observer.OnRehashDone()
+		table := c.loadShardTable()
+		_, justCompleted := c.rehasher.Step(table.shards, c.shardIndex)
+		if justCompleted {
+			c.observer.OnRehashDone()
+		}
 	}
 	return nil
 }
@@ -244,9 +271,12 @@ func (c *Cache) Get(key string) ([]byte, error) {
 	val, ok := c.getShard(key).get(key)
 	if ok {
 		c.observer.OnHit(key)
-		_, justCompleted := c.rehasher.Step(c.shards, c.shardIndex)
-		if justCompleted {
-			c.observer.OnRehashDone()
+		if c.rehasher.IsRehashing() {
+			table := c.loadShardTable()
+			_, justCompleted := c.rehasher.Step(table.shards, c.shardIndex)
+			if justCompleted {
+				c.observer.OnRehashDone()
+			}
 		}
 		return val, nil
 	}
@@ -256,7 +286,8 @@ func (c *Cache) Get(key string) ([]byte, error) {
 			val, ok = oldShard.(*shard).get(key)
 			if ok {
 				c.observer.OnHit(key)
-				_, justCompleted := c.rehasher.Step(c.shards, c.shardIndex)
+				table := c.loadShardTable()
+				_, justCompleted := c.rehasher.Step(table.shards, c.shardIndex)
 				if justCompleted {
 					c.observer.OnRehashDone()
 				}
@@ -266,9 +297,12 @@ func (c *Cache) Get(key string) ([]byte, error) {
 	}
 
 	c.observer.OnMiss(key)
-	_, justCompleted := c.rehasher.Step(c.shards, c.shardIndex)
-	if justCompleted {
-		c.observer.OnRehashDone()
+	if c.rehasher.IsRehashing() {
+		table := c.loadShardTable()
+		_, justCompleted := c.rehasher.Step(table.shards, c.shardIndex)
+		if justCompleted {
+			c.observer.OnRehashDone()
+		}
 	}
 	return nil, ErrKeyNotFound
 }
@@ -288,24 +322,23 @@ func (c *Cache) Del(key string) error {
 		if oldShard := c.rehasher.OldShard(key); oldShard != nil {
 			oldShard.Del(key)
 		}
-	}
-
-	_, justCompleted := c.rehasher.Step(c.shards, c.shardIndex)
-	if justCompleted {
-		c.observer.OnRehashDone()
+		table := c.loadShardTable()
+		_, justCompleted := c.rehasher.Step(table.shards, c.shardIndex)
+		if justCompleted {
+			c.observer.OnRehashDone()
+		}
 	}
 	return nil
 }
 
 // Len returns the total number of active entries across all shards.
 func (c *Cache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.closed {
+	if c.closed.Load() {
 		return 0
 	}
+	table := c.loadShardTable()
 	total := 0
-	for _, s := range c.shards {
+	for _, s := range table.shards {
 		total += s.Len()
 	}
 	for _, s := range c.rehasher.OldShards() {
@@ -318,11 +351,11 @@ func (c *Cache) Len() int {
 func (c *Cache) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if c.closed.Load() {
 		return ErrCacheClosed
 	}
-	c.closed = true
-	c.shards = nil
+	c.closed.Store(true)
+	c.shards.Store(&shardTable{})
 	c.rehasher.Stop()
 	return nil
 }
@@ -335,11 +368,10 @@ func (c *Cache) SetObserver(obs CacheObserver) {
 		obs = &noopObserver{}
 	}
 	c.observer = obs
-	// Update observer in all active shards
-	for _, s := range c.shards {
+	table := c.loadShardTable()
+	for _, s := range table.shards {
 		s.(*shard).observer = obs
 	}
-	// Update observer in old shards (during rehash)
 	for _, s := range c.rehasher.OldShards() {
 		if s != nil {
 			s.(*shard).observer = obs
@@ -349,13 +381,12 @@ func (c *Cache) SetObserver(obs CacheObserver) {
 
 // Cleanup removes all expired entries and returns count removed.
 func (c *Cache) Cleanup() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.closed {
+	if c.closed.Load() {
 		return 0
 	}
+	table := c.loadShardTable()
 	total := 0
-	for _, s := range c.shards {
+	for _, s := range table.shards {
 		total += s.(*shard).cleanup()
 	}
 	for _, s := range c.rehasher.OldShards() {
@@ -454,7 +485,7 @@ func (c *Cache) SUnion(keys ...string) ([]string, error) {
 	}
 	sets := make([]*set.Set, 0, len(keys))
 	for _, key := range keys {
-		for _, s := range c.shards {
+		for _, s := range c.loadShardTable().shards {
 			if ss := s.(*shard).getSet(key); ss != nil {
 				sets = append(sets, ss)
 				break
@@ -475,7 +506,7 @@ func (c *Cache) SInter(keys ...string) ([]string, error) {
 	sets := make([]*set.Set, 0, len(keys))
 	for _, key := range keys {
 		found := false
-		for _, s := range c.shards {
+		for _, s := range c.loadShardTable().shards {
 			if ss := s.(*shard).getSet(key); ss != nil {
 				sets = append(sets, ss)
 				found = true
@@ -497,7 +528,7 @@ func (c *Cache) SDiff(keys ...string) ([]string, error) {
 	sets := make([]*set.Set, 0, len(keys))
 	for _, key := range keys {
 		found := false
-		for _, s := range c.shards {
+		for _, s := range c.loadShardTable().shards {
 			if ss := s.(*shard).getSet(key); ss != nil {
 				sets = append(sets, ss)
 				found = true
@@ -511,10 +542,11 @@ func (c *Cache) SDiff(keys ...string) ([]string, error) {
 	return set.Diff(sets...).Members(), nil
 }
 
+// validateOpen is on the cache hot path (called for every Set/Get/Del). It
+// must avoid taking any locks; use the atomic flag instead. The RWMutex is
+// only used for shard-table swaps in Resize().
 func (c *Cache) validateOpen() error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.closed {
+	if c.closed.Load() {
 		return ErrCacheClosed
 	}
 	return nil
