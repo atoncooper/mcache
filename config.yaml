@@ -10,7 +10,7 @@ cache:
   cleanup_interval: "10m"   # 定期清理过期条目间隔
   observer_enabled: true     # 启用缓存事件日志（hit/miss/set/del/evict/rehash）
 
-# --- TCP 服务端 ---
+# --- mcache 服务 ---
 server:
   address: ":11211"                 # 监听地址
   workers: 256                      # 固定 worker goroutine 数
@@ -18,6 +18,7 @@ server:
   read_timeout: "30s"               # 帧读取超时
   write_timeout: "5s"               # 响应写入超时
   graceful_shutdown_timeout: "30s"  # 优雅关闭等待
+  memory_limit: "100MB"                  # 最大运行内存（软上限，仅用于监控展示）；示例: "500MB" / "1.5GB" / "2GiB"；留空表示不限制
 
   # TLS（预留）
   tls:
