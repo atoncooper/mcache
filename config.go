@@ -16,6 +16,7 @@ type Config struct {
 	Cluster ClusterConfig `yaml:"cluster"`
 	Client  ClientConfig  `yaml:"client"`
 	MBR     MBRConfig     `yaml:"mbr"`
+	Raft    RaftConfig    `yaml:"raft"`
 }
 
 // CacheConfig defines cache behaviour.
@@ -41,6 +42,7 @@ type ServerConfig struct {
 	Auth                    AuthConfig    `yaml:"auth"`
 	Logging                 LoggingConfig `yaml:"logging"`
 	Metrics                 MetricsConfig `yaml:"metrics"`
+	MemoryLimit             string        `yaml:"memory_limit"`
 }
 
 // TLSConfig holds TLS settings (reserved for future implementation).
@@ -81,6 +83,20 @@ type ClusterConfig struct {
 	Mode              string   `yaml:"mode"`
 	Nodes             []string `yaml:"nodes"`
 	ReplicationFactor int      `yaml:"replication_factor"`
+}
+
+// RaftConfig holds Raft consensus settings.
+type RaftConfig struct {
+	Enabled  bool             `yaml:"enabled"`
+	NodeID   uint64           `yaml:"node_id"`
+	BindAddr string           `yaml:"bind_addr"`
+	Peers    []RaftPeerConfig `yaml:"peers"`
+}
+
+// RaftPeerConfig describes a single Raft peer.
+type RaftPeerConfig struct {
+	ID   uint64 `yaml:"id"`
+	Addr string `yaml:"addr"`
 }
 
 // ClientConfig holds SDK client settings.
@@ -227,6 +243,12 @@ func DefaultConfig() Config {
 				MinShards           int     `yaml:"min_shards"`
 				MaxShards           int     `yaml:"max_shards"`
 			}{CheckInterval: "100ms", MaxMigrationTime: "5m", PauseOnCPUThreshold: 0.80, PauseOnMemThreshold: 0.85, TargetLoadPerShard: 512, MinShards: 4, MaxShards: 1024},
+		},
+		Raft: RaftConfig{
+			Enabled:  false,
+			NodeID:   1,
+			BindAddr: ":12001",
+			Peers:    []RaftPeerConfig{},
 		},
 	}
 }

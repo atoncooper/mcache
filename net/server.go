@@ -2,13 +2,34 @@ package net
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/atoncooper/mcache"
+	"github.com/atoncooper/mcache/raft"
 )
+
+// ServerStats holds process-level runtime metrics for the mcache server.
+type ServerStats struct {
+	UptimeMs       int64  `json:"uptime_ms"`
+	Connections    int    `json:"connections"`
+	PeakConns      int    `json:"peak_conns"`
+	TotalRequests  uint64 `json:"total_requests"`
+	BytesRead      uint64 `json:"bytes_read"`
+	BytesWritten   uint64 `json:"bytes_written"`
+	Goroutines     int    `json:"goroutines"`
+	CacheEntries   int    `json:"cache_entries"`
+	CacheMemory    uint64 `json:"cache_memory"`
+	MemoryLimit    uint64 `json:"memory_limit"`
+	GoVersion      string `json:"go_version"`
+	OS             string `json:"os"`
+	Arch           string `json:"arch"`
+}
 
 // Server serves cache operations over TCP using a multiplexed frame protocol.
 // It uses a fixed-size worker pool to process requests concurrently while
@@ -28,6 +49,25 @@ type Server struct {
 	conns           map[*serverConn]struct{}
 	errorLog        func(format string, v ...any)
 	infoLog         func(format string, v ...any)
+
+	memoryLimit uint64 // bytes, 0 = unlimited
+
+	// Process-level counters (all atomic).
+	stats struct {
+		startTime      time.Time
+		totalRequests  atomic.Uint64
+		bytesRead      atomic.Uint64
+		bytesWritten   atomic.Uint64
+		peakConns      atomic.Int64
+	}
+
+	// Raft integration (optional).
+	raftNode      *raft.Node
+	raftTransport *TCPTransport
+	raftPending   map[uint64]chan raftResult
+	raftPendingMu sync.Mutex
+	raftNextReqID uint64
+	raftReqIDMu   sync.Mutex
 }
 
 // job carries a decoded request from the read loop to a worker.
@@ -45,6 +85,29 @@ type job struct {
 type serverConn struct {
 	netConn net.Conn
 	writeMu sync.Mutex
+	srv     *Server
+}
+
+// countingConn wraps a net.Conn to track bytes read/written.
+type countingConn struct {
+	net.Conn
+	srv *Server
+}
+
+func (c *countingConn) Read(p []byte) (n int, err error) {
+	n, err = c.Conn.Read(p)
+	if n > 0 {
+		c.srv.stats.bytesRead.Add(uint64(n))
+	}
+	return
+}
+
+func (c *countingConn) Write(p []byte) (n int, err error) {
+	n, err = c.Conn.Write(p)
+	if n > 0 {
+		c.srv.stats.bytesWritten.Add(uint64(n))
+	}
+	return
 }
 
 // ServerOption configures the server.
@@ -102,6 +165,14 @@ func WithGracefulShutdownTimeout(d time.Duration) ServerOption {
 	}
 }
 
+// WithMemoryLimit sets a soft memory limit (bytes) for the server process.
+// Used only for monitoring/reporting; Go runtime is not hard-capped.
+func WithMemoryLimit(bytes uint64) ServerOption {
+	return func(s *Server) {
+		s.memoryLimit = bytes
+	}
+}
+
 // NewServer creates a multiplexed TCP cache server.
 func NewServer(c *mcache.Cache, opts ...ServerOption) *Server {
 	s := &Server{
@@ -115,7 +186,71 @@ func NewServer(c *mcache.Cache, opts ...ServerOption) *Server {
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.stats.startTime = time.Now()
 	return s
+}
+
+// Stats returns a snapshot of process-level server metrics.
+func (s *Server) Stats() ServerStats {
+	s.connMu.Lock()
+	connCount := len(s.conns)
+	s.connMu.Unlock()
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	return ServerStats{
+		UptimeMs:      time.Since(s.stats.startTime).Milliseconds(),
+		Connections:   connCount,
+		PeakConns:     int(s.stats.peakConns.Load()),
+		TotalRequests: s.stats.totalRequests.Load(),
+		BytesRead:     s.stats.bytesRead.Load(),
+		BytesWritten:  s.stats.bytesWritten.Load(),
+		Goroutines:    runtime.NumGoroutine(),
+		CacheEntries:  s.cache.Len(),
+		CacheMemory:   ms.Alloc,
+		MemoryLimit:   s.memoryLimit,
+		GoVersion:     runtime.Version(),
+		OS:            runtime.GOOS,
+		Arch:          runtime.GOARCH,
+	}
+}
+
+// InitRaft initialises the Raft consensus layer for replicated cache operations.
+// Call before ListenAndServe. Pass nodeID starting from 1, bindAddr for Raft
+// peer communication, and peers map (peerID -> "host:port").
+func (s *Server) InitRaft(nodeID uint64, bindAddr string, peers map[uint64]string) error {
+	trans := NewTCPTransport(nodeID, bindAddr, peers)
+	if err := trans.Start(); err != nil {
+		return fmt.Errorf("raft transport: %w", err)
+	}
+
+	peerList := make([]string, 0, len(peers))
+	for _, addr := range peers {
+		peerList = append(peerList, addr)
+	}
+
+	cfg := raft.Config{
+		NodeID:            nodeID,
+		Peers:             peerList,
+		HeartbeatInterval: 100 * time.Millisecond,
+		ElectionTimeout:   500 * time.Millisecond,
+		CommitTimeout:     50 * time.Millisecond,
+		MaxLogEntries:     10000,
+	}
+
+	node := raft.NewNode(cfg, trans, s.onRaftApply)
+	node.Start()
+
+	s.raftNode = node
+	s.raftTransport = trans
+	s.raftPending = make(map[uint64]chan raftResult)
+	return nil
+}
+
+// IsRaftLeader returns true if the local node is the Raft leader.
+func (s *Server) IsRaftLeader() bool {
+	return s.raftNode != nil && s.raftNode.State() == raft.Leader
 }
 
 // ListenAndServe starts the TCP listener and blocks until the server is closed.
@@ -148,9 +283,21 @@ func (s *Server) ListenAndServe(addr string) error {
 			conn.Close()
 			continue
 		}
-		sc := &serverConn{netConn: conn}
+		cc := &countingConn{Conn: conn, srv: s}
+		sc := &serverConn{netConn: cc, srv: s}
 		s.conns[sc] = struct{}{}
+		curr := len(s.conns)
 		s.connMu.Unlock()
+
+		for {
+			peak := int(s.stats.peakConns.Load())
+			if curr <= peak {
+				break
+			}
+			if s.stats.peakConns.CompareAndSwap(int64(peak), int64(curr)) {
+				break
+			}
+		}
 
 		if s.infoLog != nil {
 			s.infoLog("connection opened remote=%s", conn.RemoteAddr().String())
@@ -192,6 +339,13 @@ func (s *Server) Close() error {
 		}
 	} else {
 		<-done
+	}
+
+	if s.raftNode != nil {
+		s.raftNode.Shutdown()
+	}
+	if s.raftTransport != nil {
+		s.raftTransport.Shutdown()
 	}
 
 	close(s.jobCh)
@@ -274,6 +428,7 @@ func (s *Server) handleConn(sc *serverConn) {
 
 		select {
 		case s.jobCh <- &job{sc: sc, streamID: frame.StreamID, req: kvReq, setReq: setReq, hashReq: hashReq, listReq: listReq}:
+			s.stats.totalRequests.Add(1)
 		default:
 			// Backpressure: job queue is full.
 			resp := &Response{Status: StatusErr, ErrMsg: "server overloaded"}
@@ -374,6 +529,20 @@ func (s *Server) writeResponse(sc *serverConn, streamID uint32, resp *Response) 
 }
 
 func (s *Server) process(req *Request) *Response {
+	// If Raft is enabled, writes must go through the consensus log.
+	if s.raftNode != nil && isRaftWriteOp(req.Cmd) {
+		if s.raftNode.State() != raft.Leader {
+			return &Response{Status: StatusErr, ErrMsg: "not leader"}
+		}
+		rc := RaftCommand{Op: req.Cmd, Key: req.Key, Value: req.Value, TTL: req.TTL}
+		if _, err := s.raftPropose(rc); err != nil {
+			return &Response{Status: StatusErr, ErrMsg: err.Error()}
+		}
+		// After successful apply, return OK. The actual cache update
+		// happened in onRaftApply on this node (and all peers).
+		return &Response{Status: StatusOK}
+	}
+
 	switch req.Cmd {
 	case CmdGet:
 		val, err := s.cache.Get(req.Key)
@@ -412,6 +581,14 @@ func (s *Server) process(req *Request) *Response {
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, uint64(n))
 		return &Response{Status: StatusOK, Value: buf}
+
+	case CmdStats:
+		stats := s.Stats()
+		data, err := json.Marshal(stats)
+		if err != nil {
+			return &Response{Status: StatusErr, ErrMsg: err.Error()}
+		}
+		return &Response{Status: StatusOK, Value: data}
 
 	// Key management commands
 	case CmdExists:
@@ -531,6 +708,9 @@ func (s *Server) process(req *Request) *Response {
 }
 
 func (s *Server) processSet(req *SetRequest) []byte {
+	if s.raftNode != nil && isRaftWriteOp(req.Cmd) {
+		return s.processSetRaft(req)
+	}
 	switch req.Cmd {
 	case CmdSAdd:
 		added, err := s.cache.SAdd(req.Key, req.Elems...)

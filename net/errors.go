@@ -1,6 +1,10 @@
 package net
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/atoncooper/mcache"
+)
 
 var (
 	ErrServerClosed   = errors.New("server closed")
@@ -8,4 +12,5 @@ var (
 	ErrReadTimeout    = errors.New("read timeout")
 	ErrConnClosed     = errors.New("connection closed")
 	ErrBadResponse    = errors.New("bad response from server")
+	ErrNotLeader      = mcache.ErrNotLeader
 )

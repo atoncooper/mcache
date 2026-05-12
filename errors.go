@@ -18,4 +18,5 @@ var (
 	ErrFieldNotFound   = errors.New("field not found")
 	ErrIndexOutOfRange = errors.New("index out of range")
 	ErrInvalidIncr     = errors.New("value is not an integer or float")
+	ErrNotLeader       = errors.New("not leader")
 )
