@@ -447,6 +447,7 @@ server:
 | [数据结构](docs/set.md) | Set / Hash / List 数据结构实现参考 |
 | [Docker 部署](docs/docker.md) | 构建、运行、发布到 Docker Hub |
 | [扩展接口](docs/extending.md) | 自定义淘汰策略、Rehash 策略和编解码 |
+| [发布指南](docs/releasing.md) | 服务端 / Go SDK / Python SDK 的版本规划与发布流程 |
 
 ## 测试
 
