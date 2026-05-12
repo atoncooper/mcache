@@ -109,7 +109,7 @@ type Event struct {
 
 ## 系统监控 — Monitor
 
-`monitor` 子包采集系统级资源指标（CPU、内存、IO、网络），提供最近 N 个快照的历史查询。
+`monitor` 子包采集系统级资源指标（CPU、内存、IO、网络），提供最近 N 个快照的历史查询，主要用于 MBR 决策引擎。CLI `mcache monitor` 则通过服务端 `ServerStats` API 展示**进程级**资源使用情况。
 
 ### 创建 Monitor
 
@@ -225,14 +225,32 @@ monitor.RegisterCollector("nvidia-smi", func() monitor.Collector {
 ### CLI 集成
 
 ```bash
-# 查看系统资源使用（需服务端开启 monitor）
+# 查看服务端进程资源使用
 mcache monitor
+mcache monitor --watch 2s
 ```
 
 输出示例：
 ```
-CPU:  23.5% (cores: 8, load: 2.1/1.8/1.5)
-Mem:  45.2% (7.2G/16.0G)
-IO:   sda  R:12.3MB/s W:5.1MB/s
-Net:  eth0 TX:1.2MB/s RX:8.7MB/s
+=== mcache Process Monitor ===
+Uptime:      5m32s
+Go Version:  go1.24.3 linux/amd64
+
+Memory:
+  Heap Used:    30.25 MiB / 500.00 MiB  [====----------------]  6.1%
+  Goroutines:   42
+
+Cache:
+  Entries:      1250
+
+Network I/O:
+  Connections:  12 (peak 25)
+  Requests:     15320 total
+  Bytes Read:   2.15 MiB
+  Bytes Written: 4.82 MiB
+  Read Rate:    6.63 KiB/s
+  Write Rate:   14.89 KiB/s
+  Req Rate:     46.2/s
 ```
+
+`mcache monitor` 的数据来源是服务端 `Stats()` API，展示进程级 runtime 指标（堆内存、goroutine、连接数、网络 IO），而非系统级 CPU/磁盘。若需系统级监控，请直接使用 `monitor` 子包的编程 API。

@@ -148,6 +148,38 @@ mbr:
 | `nodes` | []string | `[]` | 集群节点地址列表 |
 | `replication_factor` | int | `1` | 复制因子 |
 
+## raft — Raft 共识配置
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `false` | 是否启用 Raft 多节点复制 |
+| `node_id` | uint64 | `1` | 当前节点唯一标识（从 1 开始递增） |
+| `bind_addr` | string | `":12001"` | Raft 节点间 TCP 通信监听地址 |
+| `peers` | []object | `[]` | 其他对等节点列表（不含自身） |
+
+### raft.peers
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | uint64 | 对等节点 ID |
+| `addr` | string | 对等节点通信地址（host:port） |
+
+**三节点示例：**
+
+```yaml
+raft:
+  enabled: true
+  node_id: 1
+  bind_addr: ":12001"
+  peers:
+    - id: 2
+      addr: "10.0.0.2:12001"
+    - id: 3
+      addr: "10.0.0.3:12001"
+```
+
+启用后，所有写操作（KV / Hash / List / Set）自动通过 Raft 日志复制到多数节点，读操作仍直接查询本地缓存。非 Leader 节点收到写请求会返回 `not leader` 错误，客户端应重定向到 Leader。
+
 ## client — SDK 客户端配置
 
 | 字段 | 类型 | 默认值 | 说明 |

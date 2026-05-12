@@ -31,6 +31,7 @@ defer client.Close()
 | `WithReadTimeout(d)` | `10s` | 响应读取超时 |
 | `WithWriteTimeout(d)` | `5s` | 请求写入超时 |
 | `WithCodec(c)` | `RawCodec{}` | 编解码器（RawCodec / JSONCodec） |
+| `WithAddrs(addrs...)` | `nil` | 集群节点地址列表（用于集群配置） |
 
 ### CRUD 操作
 
@@ -153,19 +154,73 @@ key → FNV-1a → hash % len(nodes) → node
 - 每个 key 映射到固定的节点
 - 节点增减时所有 key 重新分布（适合节点数量较稳定的场景）
 
+### 集群节点状态查询
+
+```go
+stats := cluster.Stats()
+for _, ns := range stats {
+    if ns.Err != nil {
+        fmt.Printf("节点 %s 异常: %v\n", ns.Addr, ns.Err)
+        continue
+    }
+    fmt.Printf("节点 %s 状态: %s\n", ns.Addr, string(ns.Stats))
+}
+```
+
+`Stats()` 向每个节点发送 `STATS` 命令，返回 `[]NodeStats`：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `Addr` | `string` | 节点地址 |
+| `Stats` | `[]byte` | 节点返回的原始 JSON 数据 |
+| `Err` | `error` | 查询该节点时的错误（如有） |
+
+### 集群使用限制
+
+1. **无自动故障转移**：节点故障时需自行处理重试或切换
+2. **集合多键路由**：`SUnion` / `SInter` / `SDiff` 按第一个 key 路由，需确保相关 key 在同一节点
+3. **Keys 可能重复**：`Keys()` 聚合所有节点结果，Raft 复制场景下可能出现重复 key
+4. **无动态扩缩容**：节点列表在创建时固定，不支持运行时增删节点
+
+## Raft 集群与 ErrNotLeader
+
+当服务端启用 Raft 共识时，写请求必须由 Leader 处理。如果 SDK 连接到 Follower 节点，会收到 `ErrNotLeader` 错误。
+
+```go
+err := cluster.Set("key", value, time.Minute)
+if errors.Is(err, sdk.ErrNotLeader) {
+    // 当前连接的节点不是 Leader，建议：
+    // 1. 轮询其他节点
+    // 2. 从 Stats() 中识别 Leader（看节点状态）
+    // 3. 在应用层实现重定向逻辑
+}
+```
+
+**建议**：配合 Raft 使用时，在应用层维护 Leader 地址，或对所有节点进行重试。
+
 ## 错误处理
 
 ```go
 var val []byte
 err := client.Get("missing-key", &val)
-if err == sdk.ErrKeyNotFound {
+if errors.Is(err, sdk.ErrKeyNotFound) {
     // key 不存在
+} else if errors.Is(err, sdk.ErrNotLeader) {
+    // Raft 场景：当前节点不是 Leader
 } else if err != nil {
     // 网络超时、连接关闭等
 }
 ```
 
-SDK 将服务端返回的 `StatusErr` 转换为 Go error，`StatusNotFound` 转换为 `ErrKeyNotFound`。
+| 错误常量 | 说明 |
+|----------|------|
+| `ErrKeyNotFound` | key 不存在 |
+| `ErrKeyEmpty` | key 为空 |
+| `ErrValueNil` | value 为 nil |
+| `ErrConnClosed` | 连接已关闭 |
+| `ErrTimeout` | 操作超时 |
+| `ErrNoNodes` | 集群无可用节点 |
+| `ErrNotLeader` | Raft 场景：当前节点不是 Leader（写操作需重定向到 Leader） |
 
 ## 连接健康
 

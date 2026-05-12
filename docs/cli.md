@@ -18,7 +18,8 @@
 |------|------|
 | `mcache server [--daemon] [--pidfile]` | 启动 TCP 服务端 |
 | `mcache stop [--pidfile]` | 停止后台服务 |
-| `mcache monitor` | 系统资源监控 |
+| `mcache monitor [--watch]` | 进程资源监控 |
+| `mcache cluster nodes --cluster-config <file>` | 查看集群节点状态 |
 | `mcache version` | 版本信息 |
 | `mcache help` | 帮助 |
 
@@ -27,7 +28,7 @@
 | 命令 | 说明 |
 |------|------|
 | `mcache get <k>` | 读取键值 |
-| `mcache set <k> <v> [--ttl]` | 写入键值 |
+| `mcache set <k> <v> [--ttl 30s]` | 写入键值，TTL 支持 s/m/h |
 | `mcache del <k>` | 删除键 |
 | `mcache len` | 总条目数 |
 | `mcache cleanup` | 清理过期条目 |
@@ -271,11 +272,69 @@ REPL 内建命令覆盖全部 53 个 CLI 命令：`get`, `set`, `del`, `len`, `c
 
 ```bash
 mcache monitor
+mcache monitor --watch 2s
 ```
 
-输出当前系统快照：CPU 使用率、内存使用、磁盘 IO、网络流量等。
+输出 mcache **进程级**资源快照：堆内存使用（含上限进度条）、goroutine 数、缓存条目数、连接数、网络 IO 吞吐量等。数据来自服务端 `ServerStats` API，不是系统级监控。
+
+```
+=== mcache Process Monitor ===
+Uptime:      5m32s
+Go Version:  go1.24.3 linux/amd64
+
+Memory:
+  Heap Used:    30.25 MiB / 500.00 MiB  [====----------------]  6.1%
+  Goroutines:   42
+
+Cache:
+  Entries:      1250
+
+Network I/O:
+  Connections:  12 (peak 25)
+  Requests:     15320 total
+  Bytes Read:   2.15 MiB
+  Bytes Written: 4.82 MiB
+  Read Rate:    6.63 KiB/s
+  Write Rate:   14.89 KiB/s
+  Req Rate:     46.2/s
+```
+
+使用 `--watch` 可定时刷新（如 `--watch 2s`）。
 
 详见 [可观测性](observability.md#系统监控-monitor)。
+
+## 集群管理
+
+```bash
+# 查看集群节点健康状态
+mcache cluster nodes --cluster-config cluster.yaml
+```
+
+输出示例：
+
+```
+Mode:  shard
+Nodes: 3
+
+  10.0.0.1:11211       weight=1     healthy
+  10.0.0.2:11211       weight=1     healthy
+  10.0.0.3:11211       weight=1     unhealthy
+```
+
+`cluster.yaml` 示例：
+
+```yaml
+mode: shard
+nodes:
+  - addr: 10.0.0.1:11211
+    weight: 1
+  - addr: 10.0.0.2:11211
+    weight: 1
+  - addr: 10.0.0.3:11211
+    weight: 1
+```
+
+详见 [集群管理](cluster.md)。
 
 ## 版本信息
 
