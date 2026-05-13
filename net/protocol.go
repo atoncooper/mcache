@@ -54,21 +54,27 @@ type Frame struct {
 	Payload  []byte
 }
 
-// Encode writes the frame to w.
+// Encode writes the frame to w in a single syscall.
 func (f *Frame) Encode(w io.Writer) error {
-	header := make([]byte, 10)
-	binary.BigEndian.PutUint32(header[0:4], uint32(len(f.Payload)))
-	binary.BigEndian.PutUint32(header[4:8], f.StreamID)
-	header[8] = f.Type
-	header[9] = f.Flags
-	if _, err := w.Write(header); err != nil {
-		return err
+	total := 10 + len(f.Payload)
+	var buf []byte
+	if total <= 4096 {
+		buf = getBuf(total)
+	} else {
+		buf = make([]byte, total)
 	}
+	binary.BigEndian.PutUint32(buf[0:4], uint32(len(f.Payload)))
+	binary.BigEndian.PutUint32(buf[4:8], f.StreamID)
+	buf[8] = f.Type
+	buf[9] = f.Flags
 	if len(f.Payload) > 0 {
-		_, err := w.Write(f.Payload)
-		return err
+		copy(buf[10:], f.Payload)
 	}
-	return nil
+	_, err := w.Write(buf)
+	if total <= 4096 {
+		putBuf(buf)
+	}
+	return err
 }
 
 // DecodeFrame reads a Frame from r. The caller should call PutFrame when done

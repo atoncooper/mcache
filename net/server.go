@@ -70,6 +70,8 @@ type Server struct {
 	raftReqIDMu   sync.Mutex
 }
 
+var jobPool = sync.Pool{New: func() any { return &job{} }}
+
 // job carries a decoded request from the read loop to a worker.
 type job struct {
 	sc       *serverConn
@@ -78,6 +80,15 @@ type job struct {
 	setReq   *SetRequest  // non-nil for set commands
 	hashReq  *HashRequest // non-nil for hash commands
 	listReq  *ListRequest // non-nil for list commands
+}
+
+func (j *job) reset() {
+	j.sc = nil
+	j.streamID = 0
+	j.req = nil
+	j.setReq = nil
+	j.hashReq = nil
+	j.listReq = nil
 }
 
 // responsePayload carries an encoded response ready to write.
@@ -450,7 +461,16 @@ func (s *Server) handleConn(sc *serverConn) {
 	PutFrame(frame)
 
 	s.stats.totalRequests.Add(1)
-	payload := s.processRequest(&job{sc: sc, streamID: sid, req: kvReq, setReq: setReq, hashReq: hashReq, listReq: listReq})
+	j := jobPool.Get().(*job)
+	j.sc = sc
+	j.streamID = sid
+	j.req = kvReq
+	j.setReq = setReq
+	j.hashReq = hashReq
+	j.listReq = listReq
+	payload := s.processRequest(j)
+	j.reset()
+	jobPool.Put(j)
 	s.writeResponseFrame(sc, sid, payload)
 }
 }

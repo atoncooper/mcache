@@ -11,165 +11,410 @@ import (
 	"github.com/atoncooper/mcache/ds/set"
 )
 
+const subShardsPerShard = 8
+
+// subShard is a lock-protected partition within a shard.
+// Each subShard has its own RWMutex, entry map, and independent LRU/LFU policy.
+type subShard struct {
+	mu      sync.RWMutex
+	entries map[string]cacheEntry
+	policy  EvictionPolicy
+}
+
 // shard is a thread-safe partition of the cache.
+// String key entries are split across 8 sub-shards for lower lock contention.
+// Set/Hash/List operations use shared maps with dedicated locks (low-frequency ops).
 type shard struct {
-	mu       sync.RWMutex
-	entries  map[string]cacheEntry
-	sets     map[string]*set.Set
-	hashes   map[string]*hash.Hash
-	lists    map[string]*list.List
-	policy   EvictionPolicy
-	maxSize  int
+	subs       [subShardsPerShard]*subShard
+	numSubs    int // actual number of active sub-shards (≤8)
+	maxSubSize int // per-subShard max entry count
+
+	// Set/Hash/List maps use dedicated locks (not sub-sharded — low frequency).
+	setMu  sync.RWMutex
+	sets   map[string]*set.Set
+	hashMu sync.RWMutex
+	hashes map[string]*hash.Hash
+	listMu sync.RWMutex
+	lists  map[string]*list.List
+
 	observer CacheObserver
 }
 
-func newShard(policy EvictionPolicy, maxSize int, observer CacheObserver) *shard {
-	return &shard{
-		entries:  make(map[string]cacheEntry),
+// effectiveSubShards returns the number of sub-shards to use for the given maxSize.
+// For small maxSize, fewer sub-shards preserve the exact capacity limit.
+func effectiveSubShards(maxSize int) int {
+	if maxSize <= 0 {
+		return subShardsPerShard
+	}
+	n := maxSize / 2 // each sub-shard should hold at least 2 entries
+	if n < 1 {
+		n = 1
+	}
+	if n > subShardsPerShard {
+		n = subShardsPerShard
+	}
+	return n
+}
+
+// newShard creates a shard with sub-shards, each having its own policy instance.
+// When maxSize is small (<16), fewer sub-shards are used to preserve capacity semantics.
+func newShard(policyFactory func() EvictionPolicy, maxSize int, observer CacheObserver) *shard {
+	s := &shard{
 		sets:     make(map[string]*set.Set),
 		hashes:   make(map[string]*hash.Hash),
 		lists:    make(map[string]*list.List),
-		policy:   policy,
-		maxSize:  maxSize,
 		observer: observer,
 	}
+	nSub := effectiveSubShards(maxSize)
+	subMax := maxSize / nSub
+	if subMax < 1 && maxSize > 0 {
+		subMax = 1
+	}
+	s.numSubs = nSub
+	s.maxSubSize = subMax
+	for i := 0; i < nSub; i++ {
+		s.subs[i] = &subShard{
+			entries: make(map[string]cacheEntry),
+			policy:  policyFactory(),
+		}
+	}
+	// Remaining sub-shard slots stay nil; subIndex maps to valid sub-shards only.
+	return s
 }
 
-// get returns a value if present and not expired.
+// subIndex maps a key to a sub-shard index using byte sampling (faster than full FNV).
+func (s *shard) subIndex(key string) int {
+	return (int(key[0])*31 ^ int(key[len(key)-1])) % s.numSubs
+}
+
+// --- KV operations (hot path — routed to sub-shard) ---
+
 func (s *shard) get(key string) ([]byte, bool) {
-	s.mu.RLock()
-	entry, ok := s.entries[key]
-	s.mu.RUnlock()
+	idx := s.subIndex(key)
+	sub := s.subs[idx]
+	sub.mu.RLock()
+	entry, ok := sub.entries[key]
+	sub.mu.RUnlock()
 
 	if !ok {
 		return nil, false
 	}
 	if entry.isExpired() {
-		s.mu.Lock()
-		if e, ok2 := s.entries[key]; ok2 && e.isExpired() {
-			delete(s.entries, key)
-			s.policy.OnRemove(key)
+		sub.mu.Lock()
+		if e, ok2 := sub.entries[key]; ok2 && e.isExpired() {
+			delete(sub.entries, key)
+			sub.policy.OnRemove(key)
 		}
-		s.mu.Unlock()
+		sub.mu.Unlock()
 		return nil, false
 	}
 	return append([]byte(nil), entry.value...), true
 }
 
-// Set stores a value with optional TTL and returns any evicted keys.
 func (s *shard) Set(key string, value []byte, ttl time.Duration) []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, existed := s.entries[key]
-	s.entries[key] = newEntry(value, ttl)
+	idx := s.subIndex(key)
+	sub := s.subs[idx]
+	sub.mu.Lock()
+	defer sub.mu.Unlock()
+	_, existed := sub.entries[key]
+	sub.entries[key] = newEntry(value, ttl)
 	var evicted []string
 	if existed {
-		s.policy.OnAccess(key)
+		sub.policy.OnAccess(key)
 	} else {
-		s.policy.OnAdd(key)
-		for s.maxSize > 0 && len(s.entries) > s.maxSize {
-			evictKey, ok := s.policy.Evict()
+		sub.policy.OnAdd(key)
+		for s.maxSubSize > 0 && len(sub.entries) > s.maxSubSize {
+			evictKey, ok := sub.policy.Evict()
 			if !ok {
 				break
 			}
-			delete(s.entries, evictKey)
+			delete(sub.entries, evictKey)
 			evicted = append(evicted, evictKey)
 		}
 	}
 	return evicted
 }
 
-// Del removes a key from all typed maps.
 func (s *shard) Del(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.entries[key]; ok {
-		delete(s.entries, key)
-		s.policy.OnRemove(key)
+	idx := s.subIndex(key)
+	sub := s.subs[idx]
+	sub.mu.Lock()
+	if _, ok := sub.entries[key]; ok {
+		delete(sub.entries, key)
+		sub.policy.OnRemove(key)
 	}
+	sub.mu.Unlock()
+
+	// Typed maps use dedicated locks; lock ordering: always acquire typed locks after sub lock.
+	s.setMu.Lock()
 	delete(s.sets, key)
+	s.setMu.Unlock()
+	s.hashMu.Lock()
 	delete(s.hashes, key)
+	s.hashMu.Unlock()
+	s.listMu.Lock()
 	delete(s.lists, key)
+	s.listMu.Unlock()
 }
 
-// Len returns the number of active entries (string keys only).
+// --- Iteration methods (acquire all sub-shard locks in ascending order) ---
+
 func (s *shard) Len() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	count := 0
-	for _, e := range s.entries {
-		if !e.isExpired() {
-			count++
+	for i := 0; i < s.numSubs; i++ {
+		sub := s.subs[i]
+		sub.mu.RLock()
+		for _, e := range sub.entries {
+			if !e.isExpired() {
+				count++
+			}
 		}
+		sub.mu.RUnlock()
 	}
 	return count
 }
 
-// cleanup removes expired entries and returns count removed.
 func (s *shard) cleanup() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	removed := 0
-	for k, e := range s.entries {
-		if e.isExpired() {
-			delete(s.entries, k)
-			s.policy.OnRemove(k)
-			removed++
+	for i := 0; i < s.numSubs; i++ {
+		sub := s.subs[i]
+		sub.mu.Lock()
+		for k, e := range sub.entries {
+			if e.isExpired() {
+				delete(sub.entries, k)
+				sub.policy.OnRemove(k)
+				removed++
+			}
 		}
+		sub.mu.Unlock()
 	}
 	return removed
 }
 
-// swapPolicy replaces the policy and seeds it with existing keys.
-func (s *shard) swapPolicy(newPolicy EvictionPolicy) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for k := range s.entries {
-		newPolicy.OnAdd(k)
+// swapPolicy replaces all sub-shard policies. Locks sub-shards in ascending order
+// to prevent deadlock with concurrent Set/Get/Del which lock a single sub-shard.
+func (s *shard) swapPolicy(newPolicyFunc func() EvictionPolicy) {
+	for i := 0; i < s.numSubs; i++ {
+		sub := s.subs[i]
+		sub.mu.Lock()
+		newPolicy := newPolicyFunc()
+		for k := range sub.entries {
+			newPolicy.OnAdd(k)
+		}
+		sub.policy = newPolicy
+		sub.mu.Unlock()
 	}
-	s.policy = newPolicy
 }
 
-// ExtractN removes and returns up to n active entries.
 func (s *shard) ExtractN(n int) []rehash.Item {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	items := make([]rehash.Item, 0, n)
 	now := time.Now().UnixNano()
-	for k, e := range s.entries {
-		if e.expiresAt > 0 && now >= e.expiresAt {
-			delete(s.entries, k)
-			s.policy.OnRemove(k)
-			continue
-		}
-		var ttl time.Duration
-		if e.expiresAt > 0 {
-			ttl = time.Until(time.Unix(0, e.expiresAt))
-			if ttl <= 0 {
-				delete(s.entries, k)
-				s.policy.OnRemove(k)
+	for i := 0; i < subShardsPerShard && len(items) < n; i++ {
+		sub := s.subs[i]
+		sub.mu.Lock()
+		for k, e := range sub.entries {
+			if e.expiresAt > 0 && now >= e.expiresAt {
+				delete(sub.entries, k)
+				sub.policy.OnRemove(k)
 				continue
 			}
+			var ttl time.Duration
+			if e.expiresAt > 0 {
+				ttl = time.Until(time.Unix(0, e.expiresAt))
+				if ttl <= 0 {
+					delete(sub.entries, k)
+					sub.policy.OnRemove(k)
+					continue
+				}
+			}
+			items = append(items, rehash.Item{
+				Key:   k,
+				Value: append([]byte(nil), e.value...),
+				TTL:   ttl,
+			})
+			delete(sub.entries, k)
+			sub.policy.OnRemove(k)
+			if len(items) >= n {
+				sub.mu.Unlock()
+				return items
+			}
 		}
-		items = append(items, rehash.Item{
-			Key:   k,
-			Value: append([]byte(nil), e.value...),
-			TTL:   ttl,
-		})
-		delete(s.entries, k)
-		s.policy.OnRemove(k)
-		if len(items) >= n {
-			break
-		}
+		sub.mu.Unlock()
 	}
 	return items
 }
 
-// --- Set operations ---
+// --- Key management (iterate all sub-shards) ---
+
+func (s *shard) keyExists(key string) bool {
+	idx := s.subIndex(key)
+	sub := s.subs[idx]
+	sub.mu.RLock()
+	e, ok := sub.entries[key]
+	sub.mu.RUnlock()
+	if ok && !e.isExpired() {
+		return true
+	}
+	// Check typed maps
+	s.setMu.RLock()
+	_, ok = s.sets[key]
+	s.setMu.RUnlock()
+	if ok {
+		return true
+	}
+	s.hashMu.RLock()
+	_, ok = s.hashes[key]
+	s.hashMu.RUnlock()
+	if ok {
+		return true
+	}
+	s.listMu.RLock()
+	_, ok = s.lists[key]
+	s.listMu.RUnlock()
+	return ok
+}
+
+func (s *shard) keyType(key string) byte {
+	idx := s.subIndex(key)
+	sub := s.subs[idx]
+	sub.mu.RLock()
+	e, ok := sub.entries[key]
+	sub.mu.RUnlock()
+	if ok && !e.isExpired() {
+		return 1 // KeyTypeString
+	}
+
+	s.setMu.RLock()
+	_, ok = s.sets[key]
+	s.setMu.RUnlock()
+	if ok {
+		return 2
+	}
+	s.hashMu.RLock()
+	_, ok = s.hashes[key]
+	s.hashMu.RUnlock()
+	if ok {
+		return 3
+	}
+	s.listMu.RLock()
+	_, ok = s.lists[key]
+	s.listMu.RUnlock()
+	if ok {
+		return 4
+	}
+	return 0
+}
+
+func (s *shard) expire(key string, ttl time.Duration) bool {
+	idx := s.subIndex(key)
+	sub := s.subs[idx]
+	sub.mu.Lock()
+	defer sub.mu.Unlock()
+	e, ok := sub.entries[key]
+	if !ok || e.isExpired() {
+		return false
+	}
+	e.expiresAt = time.Now().Add(ttl).UnixNano()
+	sub.entries[key] = e
+	return true
+}
+
+func (s *shard) persist(key string) bool {
+	idx := s.subIndex(key)
+	sub := s.subs[idx]
+	sub.mu.Lock()
+	defer sub.mu.Unlock()
+	e, ok := sub.entries[key]
+	if !ok || e.isExpired() {
+		return false
+	}
+	e.expiresAt = 0
+	sub.entries[key] = e
+	return true
+}
+
+func (s *shard) ttlSeconds(key string) int64 {
+	idx := s.subIndex(key)
+	sub := s.subs[idx]
+	sub.mu.RLock()
+	defer sub.mu.RUnlock()
+	e, ok := sub.entries[key]
+	if !ok {
+		return -2
+	}
+	if e.expiresAt <= 0 {
+		return -1
+	}
+	remaining := time.Until(time.Unix(0, e.expiresAt))
+	if remaining <= 0 {
+		return -2
+	}
+	return int64(remaining / time.Second)
+}
+
+func (s *shard) ttlMillis(key string) int64 {
+	idx := s.subIndex(key)
+	sub := s.subs[idx]
+	sub.mu.RLock()
+	defer sub.mu.RUnlock()
+	e, ok := sub.entries[key]
+	if !ok {
+		return -2
+	}
+	if e.expiresAt <= 0 {
+		return -1
+	}
+	remaining := time.Until(time.Unix(0, e.expiresAt))
+	if remaining <= 0 {
+		return -2
+	}
+	return remaining.Milliseconds()
+}
+
+func (s *shard) matchKeys(pattern string) []string {
+	var matched []string
+	for i := 0; i < s.numSubs; i++ {
+		sub := s.subs[i]
+		sub.mu.RLock()
+		for k, e := range sub.entries {
+			if !e.isExpired() {
+				if ok, _ := filepath.Match(pattern, k); ok {
+					matched = append(matched, k)
+				}
+			}
+		}
+		sub.mu.RUnlock()
+	}
+	// Also check typed maps
+	s.setMu.RLock()
+	for k := range s.sets {
+		if ok, _ := filepath.Match(pattern, k); ok {
+			matched = append(matched, k)
+		}
+	}
+	s.setMu.RUnlock()
+	s.hashMu.RLock()
+	for k := range s.hashes {
+		if ok, _ := filepath.Match(pattern, k); ok {
+			matched = append(matched, k)
+		}
+	}
+	s.hashMu.RUnlock()
+	s.listMu.RLock()
+	for k := range s.lists {
+		if ok, _ := filepath.Match(pattern, k); ok {
+			matched = append(matched, k)
+		}
+	}
+	s.listMu.RUnlock()
+	return matched
+}
+
+// --- Set operations (shared locks, not sub-sharded — low frequency) ---
 
 func (s *shard) sAdd(key string, elems ...string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.setMu.Lock()
+	defer s.setMu.Unlock()
 	ss, ok := s.sets[key]
 	if !ok {
 		ss = set.New()
@@ -179,8 +424,8 @@ func (s *shard) sAdd(key string, elems ...string) int {
 }
 
 func (s *shard) sRem(key string, elems ...string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.setMu.Lock()
+	defer s.setMu.Unlock()
 	ss, ok := s.sets[key]
 	if !ok {
 		return 0
@@ -193,8 +438,8 @@ func (s *shard) sRem(key string, elems ...string) int {
 }
 
 func (s *shard) sIsMember(key, elem string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.setMu.RLock()
+	defer s.setMu.RUnlock()
 	ss, ok := s.sets[key]
 	if !ok {
 		return false
@@ -203,8 +448,8 @@ func (s *shard) sIsMember(key, elem string) bool {
 }
 
 func (s *shard) sMembers(key string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.setMu.RLock()
+	defer s.setMu.RUnlock()
 	ss, ok := s.sets[key]
 	if !ok {
 		return nil
@@ -213,8 +458,8 @@ func (s *shard) sMembers(key string) []string {
 }
 
 func (s *shard) sCard(key string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.setMu.RLock()
+	defer s.setMu.RUnlock()
 	ss, ok := s.sets[key]
 	if !ok {
 		return 0
@@ -223,8 +468,8 @@ func (s *shard) sCard(key string) int {
 }
 
 func (s *shard) sPop(key string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.setMu.Lock()
+	defer s.setMu.Unlock()
 	ss, ok := s.sets[key]
 	if !ok {
 		return "", false
@@ -240,8 +485,8 @@ func (s *shard) sPop(key string) (string, bool) {
 }
 
 func (s *shard) sRandMember(key string, count int) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.setMu.RLock()
+	defer s.setMu.RUnlock()
 	ss, ok := s.sets[key]
 	if !ok {
 		return nil
@@ -250,16 +495,16 @@ func (s *shard) sRandMember(key string, count int) []string {
 }
 
 func (s *shard) getSet(key string) *set.Set {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.setMu.RLock()
+	defer s.setMu.RUnlock()
 	return s.sets[key]
 }
 
-// --- Hash operations ---
+// --- Hash operations (shared locks, not sub-sharded) ---
 
 func (s *shard) hSet(key, field, value string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.hashMu.Lock()
+	defer s.hashMu.Unlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		h = hash.New()
@@ -269,8 +514,8 @@ func (s *shard) hSet(key, field, value string) int {
 }
 
 func (s *shard) hSetNX(key, field, value string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.hashMu.Lock()
+	defer s.hashMu.Unlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		h = hash.New()
@@ -280,8 +525,8 @@ func (s *shard) hSetNX(key, field, value string) bool {
 }
 
 func (s *shard) hGet(key, field string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.hashMu.RLock()
+	defer s.hashMu.RUnlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		return "", false
@@ -290,8 +535,8 @@ func (s *shard) hGet(key, field string) (string, bool) {
 }
 
 func (s *shard) hDel(key string, fields ...string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.hashMu.Lock()
+	defer s.hashMu.Unlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		return 0
@@ -304,8 +549,8 @@ func (s *shard) hDel(key string, fields ...string) int {
 }
 
 func (s *shard) hExists(key, field string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.hashMu.RLock()
+	defer s.hashMu.RUnlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		return false
@@ -314,8 +559,8 @@ func (s *shard) hExists(key, field string) bool {
 }
 
 func (s *shard) hGetAll(key string) map[string]string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.hashMu.RLock()
+	defer s.hashMu.RUnlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		return nil
@@ -324,8 +569,8 @@ func (s *shard) hGetAll(key string) map[string]string {
 }
 
 func (s *shard) hKeys(key string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.hashMu.RLock()
+	defer s.hashMu.RUnlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		return nil
@@ -334,8 +579,8 @@ func (s *shard) hKeys(key string) []string {
 }
 
 func (s *shard) hVals(key string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.hashMu.RLock()
+	defer s.hashMu.RUnlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		return nil
@@ -344,8 +589,8 @@ func (s *shard) hVals(key string) []string {
 }
 
 func (s *shard) hLen(key string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.hashMu.RLock()
+	defer s.hashMu.RUnlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		return 0
@@ -354,8 +599,8 @@ func (s *shard) hLen(key string) int {
 }
 
 func (s *shard) hStrLen(key, field string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.hashMu.RLock()
+	defer s.hashMu.RUnlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		return 0
@@ -364,8 +609,8 @@ func (s *shard) hStrLen(key, field string) int {
 }
 
 func (s *shard) hIncrBy(key, field string, delta int64) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.hashMu.Lock()
+	defer s.hashMu.Unlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		h = hash.New()
@@ -375,8 +620,8 @@ func (s *shard) hIncrBy(key, field string, delta int64) (int64, error) {
 }
 
 func (s *shard) hIncrByFloat(key, field string, delta float64) (float64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.hashMu.Lock()
+	defer s.hashMu.Unlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		h = hash.New()
@@ -386,8 +631,8 @@ func (s *shard) hIncrByFloat(key, field string, delta float64) (float64, error) 
 }
 
 func (s *shard) hmGet(key string, fields ...string) []any {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.hashMu.RLock()
+	defer s.hashMu.RUnlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		out := make([]any, len(fields))
@@ -397,8 +642,8 @@ func (s *shard) hmGet(key string, fields ...string) []any {
 }
 
 func (s *shard) hmSet(key string, fvPairs ...string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.hashMu.Lock()
+	defer s.hashMu.Unlock()
 	h, ok := s.hashes[key]
 	if !ok {
 		h = hash.New()
@@ -407,11 +652,11 @@ func (s *shard) hmSet(key string, fvPairs ...string) {
 	h.HMSet(fvPairs...)
 }
 
-// --- List operations ---
+// --- List operations (shared locks, not sub-sharded) ---
 
 func (s *shard) lPush(key string, elems ...string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
 	l, ok := s.lists[key]
 	if !ok {
 		l = list.New()
@@ -421,8 +666,8 @@ func (s *shard) lPush(key string, elems ...string) int {
 }
 
 func (s *shard) rPush(key string, elems ...string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
 	l, ok := s.lists[key]
 	if !ok {
 		l = list.New()
@@ -432,8 +677,8 @@ func (s *shard) rPush(key string, elems ...string) int {
 }
 
 func (s *shard) lPop(key string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
 	l, ok := s.lists[key]
 	if !ok {
 		return "", false
@@ -449,8 +694,8 @@ func (s *shard) lPop(key string) (string, bool) {
 }
 
 func (s *shard) rPop(key string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
 	l, ok := s.lists[key]
 	if !ok {
 		return "", false
@@ -466,8 +711,8 @@ func (s *shard) rPop(key string) (string, bool) {
 }
 
 func (s *shard) lLen(key string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.listMu.RLock()
+	defer s.listMu.RUnlock()
 	l, ok := s.lists[key]
 	if !ok {
 		return 0
@@ -476,8 +721,8 @@ func (s *shard) lLen(key string) int {
 }
 
 func (s *shard) lRange(key string, start, stop int) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.listMu.RLock()
+	defer s.listMu.RUnlock()
 	l, ok := s.lists[key]
 	if !ok {
 		return nil
@@ -486,8 +731,8 @@ func (s *shard) lRange(key string, start, stop int) []string {
 }
 
 func (s *shard) lIndex(key string, index int) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.listMu.RLock()
+	defer s.listMu.RUnlock()
 	l, ok := s.lists[key]
 	if !ok {
 		return "", false
@@ -496,8 +741,8 @@ func (s *shard) lIndex(key string, index int) (string, bool) {
 }
 
 func (s *shard) lSet(key string, index int, value string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
 	l, ok := s.lists[key]
 	if !ok {
 		return false
@@ -506,8 +751,8 @@ func (s *shard) lSet(key string, index int, value string) bool {
 }
 
 func (s *shard) lRem(key string, count int, value string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
 	l, ok := s.lists[key]
 	if !ok {
 		return 0
@@ -520,8 +765,8 @@ func (s *shard) lRem(key string, count int, value string) int {
 }
 
 func (s *shard) lTrim(key string, start, stop int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
 	l, ok := s.lists[key]
 	if !ok {
 		return
@@ -533,8 +778,8 @@ func (s *shard) lTrim(key string, start, stop int) {
 }
 
 func (s *shard) lInsert(key string, before bool, pivot, value string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.listMu.Lock()
+	defer s.listMu.Unlock()
 	l, ok := s.lists[key]
 	if !ok {
 		return 0
@@ -543,146 +788,11 @@ func (s *shard) lInsert(key string, before bool, pivot, value string) int {
 }
 
 func (s *shard) lPos(key string, value string, rank, count, maxLen int) []int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.listMu.RLock()
+	defer s.listMu.RUnlock()
 	l, ok := s.lists[key]
 	if !ok {
 		return nil
 	}
 	return l.LPos(value, rank, count, maxLen)
-}
-
-// --- Key management ---
-
-func (s *shard) keyExists(key string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if e, ok := s.entries[key]; ok {
-		if e.isExpired() {
-			return false
-		}
-		return true
-	}
-	if _, ok := s.sets[key]; ok {
-		return true
-	}
-	if _, ok := s.hashes[key]; ok {
-		return true
-	}
-	if _, ok := s.lists[key]; ok {
-		return true
-	}
-	return false
-}
-
-func (s *shard) keyType(key string) byte {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if e, ok := s.entries[key]; ok {
-		if !e.isExpired() {
-			return 1 // KeyTypeString
-		}
-		return 0 // expired -> KeyTypeNone
-	}
-	if _, ok := s.sets[key]; ok {
-		return 2 // KeyTypeSet
-	}
-	if _, ok := s.hashes[key]; ok {
-		return 3 // KeyTypeHash
-	}
-	if _, ok := s.lists[key]; ok {
-		return 4 // KeyTypeList
-	}
-	return 0 // KeyTypeNone
-}
-
-func (s *shard) expire(key string, ttl time.Duration) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.entries[key]; ok {
-		if e.isExpired() {
-			return false
-		}
-		e.expiresAt = time.Now().Add(ttl).UnixNano()
-		s.entries[key] = e
-		return true
-	}
-	// For typed keys (set/hash/list), we don't yet track TTL on them.
-	// Return false to indicate key doesn't exist or TTL not supported for typed keys.
-	return false
-}
-
-func (s *shard) persist(key string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.entries[key]; ok {
-		if e.isExpired() {
-			return false
-		}
-		e.expiresAt = 0
-		s.entries[key] = e
-		return true
-	}
-	return false
-}
-
-func (s *shard) ttlSeconds(key string) int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if e, ok := s.entries[key]; ok {
-		if e.expiresAt <= 0 {
-			return -1 // no expiry
-		}
-		remaining := time.Until(time.Unix(0, e.expiresAt))
-		if remaining <= 0 {
-			return -2 // expired
-		}
-		return int64(remaining / time.Second)
-	}
-	return -2 // key doesn't exist
-}
-
-func (s *shard) ttlMillis(key string) int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if e, ok := s.entries[key]; ok {
-		if e.expiresAt <= 0 {
-			return -1
-		}
-		remaining := time.Until(time.Unix(0, e.expiresAt))
-		if remaining <= 0 {
-			return -2
-		}
-		return remaining.Milliseconds()
-	}
-	return -2
-}
-
-func (s *shard) matchKeys(pattern string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var matched []string
-	for k := range s.entries {
-		if e := s.entries[k]; !e.isExpired() {
-			if ok, _ := filepath.Match(pattern, k); ok {
-				matched = append(matched, k)
-			}
-		}
-	}
-	for k := range s.sets {
-		if ok, _ := filepath.Match(pattern, k); ok {
-			matched = append(matched, k)
-		}
-	}
-	for k := range s.hashes {
-		if ok, _ := filepath.Match(pattern, k); ok {
-			matched = append(matched, k)
-		}
-	}
-	for k := range s.lists {
-		if ok, _ := filepath.Match(pattern, k); ok {
-			matched = append(matched, k)
-		}
-	}
-	return matched
 }

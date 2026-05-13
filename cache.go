@@ -81,7 +81,7 @@ func New(opts Options) (*Cache, error) {
 	}
 	shards := make([]rehash.Shard, opts.shardCount)
 	for i := range shards {
-		shards[i] = newShard(factory(), perShardMax, opts.observer)
+		shards[i] = newShard(factory, perShardMax, opts.observer)
 	}
 	c := &Cache{
 		opts:          opts,
@@ -116,12 +116,12 @@ func (c *Cache) SetEvictionPolicy(name string) error {
 
 	table := c.loadShardTable()
 	for _, s := range table.shards {
-		s.(*shard).swapPolicy(factory())
+		s.(*shard).swapPolicy(factory)
 	}
 
 	for _, s := range c.rehasher.OldShards() {
 		if s != nil {
-			s.(*shard).swapPolicy(factory())
+			s.(*shard).swapPolicy(factory)
 		}
 	}
 	return nil
@@ -190,7 +190,7 @@ func (c *Cache) Resize(shardCount int) error {
 	c.rehasher.Start(oldTable.shards, oldTable.mask)
 	newShards := make([]rehash.Shard, shardCount)
 	for i := range newShards {
-		newShards[i] = newShard(factory(), perShardMax, c.observer)
+		newShards[i] = newShard(factory, perShardMax, c.observer)
 	}
 	c.shards.Store(&shardTable{
 		shards: newShards,
