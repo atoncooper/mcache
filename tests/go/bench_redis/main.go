@@ -47,6 +47,7 @@ func main() {
 	poolSize := flag.Int("pool", 0, "connection pool size (default: goroutines)")
 	readRatio := flag.Float64("read-ratio", 0.5, "read ratio for mix mode (0.0-1.0)")
 	keySpace := flag.Int("key-space", 0, "unique key space (default: totalOps/10)")
+	pipelineSize := flag.Int("pipeline", 0, "pipeline batch size (0=disabled)")
 	password := flag.String("password", "", "Redis password")
 	db := flag.Int("db", 0, "Redis database number")
 	flag.Parse()
@@ -79,28 +80,34 @@ func main() {
 		}
 	}
 
+	pipLabel := "off"
+	if *pipelineSize > 0 {
+		pipLabel = fmt.Sprintf("%d", *pipelineSize)
+	}
 	title := fmt.Sprintf("Redis OPS Benchmark — %s | key=%dB val=%dB (%s) | %d goroutines",
 		*mode, ks, vs, formatBytes(vs), *goroutines)
 	fmt.Println(strings.Repeat("═", 80))
 	fmt.Println("  " + title)
 	fmt.Println(strings.Repeat("═", 80))
-	fmt.Printf("  target:  %s (db=%d)\n", *addr, *db)
-	fmt.Printf("  mode:    %s\n", *mode)
-	fmt.Printf("  profile: %s (key=%dB, val=%dB, payload=%s)\n", *profile, ks, vs, formatBytes(ks+vs))
-	fmt.Printf("  ops:     %d  | goroutines: %d  | pool: %d  | keyspace: %d\n\n", *totalOps, *goroutines, ps, nKeys)
+	fmt.Printf("  target:   %s (db=%d)\n", *addr, *db)
+	fmt.Printf("  mode:     %s\n", *mode)
+	fmt.Printf("  profile:  %s (key=%dB, val=%dB, payload=%s)\n", *profile, ks, vs, formatBytes(ks+vs))
+	fmt.Printf("  ops:      %d  | goroutines: %d  | pool: %d  | keyspace: %d  | pipeline: %s\n\n",
+		*totalOps, *goroutines, ps, nKeys, pipLabel)
 
 	cfg := benchConfig{
-		addr:       *addr,
-		password:   *password,
-		db:         *db,
-		mode:       *mode,
-		keySize:    ks,
-		valSize:    vs,
-		totalOps:   *totalOps,
-		goroutines: *goroutines,
-		poolSize:   ps,
-		readRatio:  *readRatio,
-		keySpace:   nKeys,
+		addr:         *addr,
+		password:     *password,
+		db:           *db,
+		mode:         *mode,
+		keySize:      ks,
+		valSize:      vs,
+		totalOps:     *totalOps,
+		goroutines:   *goroutines,
+		poolSize:     ps,
+		readRatio:    *readRatio,
+		keySpace:     nKeys,
+		pipelineSize: *pipelineSize,
 	}
 
 	result := runBenchmark(cfg)
@@ -116,6 +123,7 @@ type benchConfig struct {
 	poolSize                   int
 	readRatio                  float64
 	keySpace                   int
+	pipelineSize               int
 }
 
 type benchResult struct {
@@ -197,22 +205,52 @@ func benchSet(cfg benchConfig) benchResult {
 
 	val := fillBytes(make([]byte, cfg.valSize))
 
-	for gid := 0; gid < cfg.goroutines; gid++ {
-		wg.Add(1)
-		go func(gid int) {
-			defer wg.Done()
-			rng := rand.New(rand.NewSource(int64(gid)))
-			key := make([]byte, cfg.keySize)
-			ready.Done()
-			<-start
-			base := gid * opsPerG
-			for i := 0; i < opsPerG; i++ {
-				k := genKey(key, rng.Intn(cfg.keySpace), cfg.keySize)
-				t0 := time.Now()
-				rdb.Set(ctx, k, val, 0)
-				lats[base+i] = time.Since(t0)
-			}
-		}(gid)
+	if cfg.pipelineSize > 0 {
+		batchSz := cfg.pipelineSize
+		for gid := 0; gid < cfg.goroutines; gid++ {
+			wg.Add(1)
+			go func(gid int) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(int64(gid)))
+				ready.Done()
+				<-start
+				base := gid * opsPerG
+				for i := 0; i < opsPerG; {
+					end := min(i+batchSz, opsPerG)
+					pipe := rdb.Pipeline()
+					for j := i; j < end; j++ {
+						k := genKey(nil, rng.Intn(cfg.keySpace), cfg.keySize)
+						pipe.Set(ctx, k, val, 0)
+					}
+					t0 := time.Now()
+					_, _ = pipe.Exec(ctx)
+					elapsed := time.Since(t0)
+					perOp := elapsed / time.Duration(end-i)
+					for j := i; j < end; j++ {
+						lats[base+j] = perOp
+					}
+					i = end
+				}
+			}(gid)
+		}
+	} else {
+		for gid := 0; gid < cfg.goroutines; gid++ {
+			wg.Add(1)
+			go func(gid int) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(int64(gid)))
+				key := make([]byte, cfg.keySize)
+				ready.Done()
+				<-start
+				base := gid * opsPerG
+				for i := 0; i < opsPerG; i++ {
+					k := genKey(key, rng.Intn(cfg.keySpace), cfg.keySize)
+					t0 := time.Now()
+					rdb.Set(ctx, k, val, 0)
+					lats[base+i] = time.Since(t0)
+				}
+			}(gid)
+		}
 	}
 
 	ready.Wait()
