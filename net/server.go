@@ -461,10 +461,11 @@ func (s *Server) handleConn(sc *serverConn) {
 func (s *Server) writeLoop(sc *serverConn) {
 	defer s.wg.Done()
 	for resp := range sc.writeCh {
-		frame := getFrame()
-		frame.StreamID = resp.streamID
-		frame.Type = FrameTypeResponse
-		frame.Payload = resp.payload
+		frame := &Frame{
+			StreamID: resp.streamID,
+			Type:     FrameTypeResponse,
+			Payload:  resp.payload,
+		}
 		sc.writeMu.Lock()
 		if s.writeTimeout > 0 {
 			sc.netConn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
@@ -475,8 +476,6 @@ func (s *Server) writeLoop(sc *serverConn) {
 		}
 		sc.writeMu.Unlock()
 		putBuf(resp.payload)
-		frame.Payload = nil
-		putFrame(frame)
 	}
 }
 
@@ -544,10 +543,11 @@ func (s *Server) processJob(job *job) {
 
 // writeResponseFrame writes a pre-encoded payload to the connection.
 func (s *Server) writeResponseFrame(sc *serverConn, streamID uint32, payload []byte) {
-	frame := getFrame()
-	frame.StreamID = streamID
-	frame.Type = FrameTypeResponse
-	frame.Payload = payload
+	frame := &Frame{
+		StreamID: streamID,
+		Type:     FrameTypeResponse,
+		Payload:  payload,
+	}
 	sc.writeMu.Lock()
 	if s.writeTimeout > 0 {
 		sc.netConn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
@@ -558,8 +558,6 @@ func (s *Server) writeResponseFrame(sc *serverConn, streamID uint32, payload []b
 	}
 	sc.writeMu.Unlock()
 	putBuf(payload)
-	frame.Payload = nil
-	putFrame(frame)
 }
 
 func (s *Server) writeResponse(sc *serverConn, streamID uint32, resp *Response) {

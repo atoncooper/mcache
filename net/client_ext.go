@@ -185,10 +185,11 @@ func (cc *clientConn) doHash(req *HashRequest, readTimeout, writeTimeout time.Du
 	if payload == nil {
 		return nil, ErrBadResponse
 	}
-	frame := getFrame()
-	frame.StreamID = streamID
-	frame.Type = FrameTypeRequest
-	frame.Payload = payload
+	frame := &Frame{
+		StreamID: streamID,
+		Type:     FrameTypeRequest,
+		Payload:  payload,
+	}
 
 	if writeTimeout > 0 {
 		cc.netConn.SetWriteDeadline(time.Now().Add(writeTimeout))
@@ -197,8 +198,6 @@ func (cc *clientConn) doHash(req *HashRequest, readTimeout, writeTimeout time.Du
 	err := frame.Encode(cc.netConn)
 	cc.writeMu.Unlock()
 	putBuf(payload)
-	frame.Payload = nil
-	putFrame(frame)
 	if err != nil {
 		cc.markBad()
 		return nil, err
@@ -406,10 +405,11 @@ func (cc *clientConn) doList(req *ListRequest, readTimeout, writeTimeout time.Du
 	if payload == nil {
 		return nil, ErrBadResponse
 	}
-	frame := getFrame()
-	frame.StreamID = streamID
-	frame.Type = FrameTypeRequest
-	frame.Payload = payload
+	frame := &Frame{
+		StreamID: streamID,
+		Type:     FrameTypeRequest,
+		Payload:  payload,
+	}
 
 	if writeTimeout > 0 {
 		cc.netConn.SetWriteDeadline(time.Now().Add(writeTimeout))
@@ -418,8 +418,6 @@ func (cc *clientConn) doList(req *ListRequest, readTimeout, writeTimeout time.Du
 	err := frame.Encode(cc.netConn)
 	cc.writeMu.Unlock()
 	putBuf(payload)
-	frame.Payload = nil
-	putFrame(frame)
 	if err != nil {
 		cc.markBad()
 		return nil, err

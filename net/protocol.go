@@ -11,9 +11,6 @@ import (
 // Only buffers up to 4 KB are pooled; larger allocations go to the GC.
 var bufPool = sync.Pool{New: func() any { return make([]byte, 0, 256) }}
 
-// framePool reuses Frame structs to reduce GC pressure.
-var framePool = sync.Pool{New: func() any { return &Frame{} }}
-
 func getBuf(size int) []byte {
 	if size > 4096 {
 		return make([]byte, size)
@@ -22,6 +19,8 @@ func getBuf(size int) []byte {
 	if cap(buf) >= size {
 		return buf[:size]
 	}
+	// Buffer too small; put it back and allocate a fresh one.
+	bufPool.Put(buf[:0])
 	return make([]byte, size)
 }
 
@@ -29,18 +28,6 @@ func putBuf(buf []byte) {
 	if cap(buf) <= 4096 {
 		bufPool.Put(buf[:0])
 	}
-}
-
-func getFrame() *Frame {
-	return framePool.Get().(*Frame)
-}
-
-func putFrame(f *Frame) {
-	f.Payload = nil
-	f.StreamID = 0
-	f.Type = 0
-	f.Flags = 0
-	framePool.Put(f)
 }
 
 const (
@@ -95,10 +82,11 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 	if payloadLen > MaxPayloadSize {
 		return nil, fmt.Errorf("payload too large: %d", payloadLen)
 	}
-	f := getFrame()
-	f.StreamID = binary.BigEndian.Uint32(header[4:8])
-	f.Type = header[8]
-	f.Flags = header[9]
+	f := &Frame{
+		StreamID: binary.BigEndian.Uint32(header[4:8]),
+		Type:     header[8],
+		Flags:    header[9],
+	}
 	if payloadLen > 0 {
 		f.Payload = getBuf(int(payloadLen))
 		if _, err := io.ReadFull(r, f.Payload); err != nil {
@@ -108,7 +96,7 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 	return f, nil
 }
 
-// PutFrame returns a Frame and its payload to their respective pools.
+// PutFrame returns a Frame's payload buffer to the pool.
 func PutFrame(f *Frame) {
 	if f == nil {
 		return
@@ -116,7 +104,6 @@ func PutFrame(f *Frame) {
 	if f.Payload != nil {
 		putBuf(f.Payload)
 	}
-	putFrame(f)
 }
 
 // Request commands.
