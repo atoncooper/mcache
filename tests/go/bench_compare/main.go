@@ -1,18 +1,9 @@
-// Package main benchmarks mcache (with optional MBR) against Redis.
+// Package main benchmarks mcache against Redis side-by-side.
+// Uses the exact same code paths as bench_mcache (verified working).
 //
 // Usage:
 //
-//	# Quick comparison (pipeline=16)
-//	go run ./bench_compare --mcache 127.0.0.1:11211 --redis 127.0.0.1:6379 --mode set --profile small --ops 100000
-//
-//	# MBR stress: low shards + high load → watch MBR auto-scale
-//	# Requires server started with mbr.enabled:true, cache.shards:4 in config.yaml
-//	go run ./bench_compare --mcache 127.0.0.1:11211 --redis 127.0.0.1:6379 --mode set --profile large --ops 500000 --pipeline 32 --goroutines 128
-//
-//	# Compare all modes
-//	for mode in set get mix; do
-//	  go run ./bench_compare --mcache 127.0.0.1:11211 --redis 127.0.0.1:6379 --mode $mode --profile small --ops 100000
-//	done
+//	go run ./bench_compare --mcache 127.0.0.1:11211 --redis 127.0.0.1:6379 --mode set --profile small
 package main
 
 import (
@@ -21,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -47,14 +39,17 @@ func main() {
 	valSize := flag.Int("val-size", 0, "value size override")
 	totalOps := flag.Int("ops", 100_000, "total operations")
 	goroutines := flag.Int("goroutines", 64, "concurrent goroutines")
-	pipelineSize := flag.Int("pipeline", 16, "mcache pipeline batch size (0=off)")
+	pipelineSize := flag.Int("pipeline", 0, "mcache pipeline batch size (0=same as bench_mcache default)")
 	readRatio := flag.Float64("read-ratio", 0.5, "read ratio for mix mode")
 	keySpace := flag.Int("key-space", 0, "unique key space")
 	flag.Parse()
 
 	ks, vs := *keySize, *valSize
 	if ks == 0 || vs == 0 {
-		p := sizeProfiles[*profile]
+		p, ok := sizeProfiles[*profile]
+		if !ok {
+			p = sizeProfiles["small"]
+		}
 		if ks == 0 {
 			ks = p.keySize
 		}
@@ -71,276 +66,250 @@ func main() {
 		}
 	}
 
-	cfg := benchConfig{
-		mcacheAddr:   *mcacheAddr,
-		redisAddr:    *redisAddr,
-		mode:         *mode,
-		keySize:      ks,
-		valSize:      vs,
-		totalOps:     *totalOps,
-		goroutines:   *goroutines,
-		pipelineSize: *pipelineSize,
-		readRatio:    *readRatio,
-		keySpace:     nKeys,
-	}
+	ps := *pipelineSize
+	usePipeline := ps > 0
 
 	fmt.Println(strings.Repeat("=", 90))
-	fmt.Printf("  mcache vs Redis — %s | %dB key + %dB val | %d goroutines | pipeline=%d\n",
-		*mode, ks, vs, *goroutines, *pipelineSize)
+	pipLabel := "off"
+	if usePipeline {
+		pipLabel = fmt.Sprintf("%d", ps)
+	}
+	fmt.Printf("  mcache vs Redis — %s | %dB key + %dB val | %d goroutines | pipeline=%s\n",
+		*mode, ks, vs, *goroutines, pipLabel)
 	fmt.Println(strings.Repeat("=", 90))
 
-	// Show mcache server state before test
-	mcacheStats := fetchMcacheStats(cfg.mcacheAddr)
-	printMcacheState("  [mcache state before]", mcacheStats)
+	// Fetch and display mcache server state before test
+	printMcacheState("  [mcache state before]", *mcacheAddr)
 
-	// Run benchmarks
-	mResult := benchMcache(cfg)
-	rResult := benchRedis(cfg)
+	// --- Run benchmarks (same logic as bench_mcache + bench_redis) ---
+	mResult := runMcache(*mcacheAddr, *mode, ks, vs, *totalOps, *goroutines, ps, *readRatio, nKeys)
+	rResult := runRedis(*redisAddr, *mode, ks, vs, *totalOps, *goroutines, *readRatio, nKeys)
 
-	// Show mcache server state after test (to see if MBR migrated shards)
-	mcacheStatsAfter := fetchMcacheStats(cfg.mcacheAddr)
-	printMcacheState("  [mcache state after ]", mcacheStatsAfter)
+	// Fetch and display mcache server state after test
+	printMcacheState("  [mcache state after ]", *mcacheAddr)
 
-	if mcacheStatsAfter.CacheEntries != mcacheStats.CacheEntries ||
-		len(mcacheStatsAfter.Value) != len(mcacheStats.Value) {
-		fmt.Println("  ⚡ MBR may have triggered migration (state changed during test)")
-	}
-
-	// Print comparison table
+	// Print comparison
 	fmt.Println()
 	fmt.Println(strings.Repeat("─", 90))
-	fmt.Printf("  %-15s │ %14s │ %14s │ %10s\n", "metric", "mcache", "redis", "mcache/redis")
+	fmt.Printf("  %-18s │ %14s │ %14s │ %10s\n", "metric", "mcache", "redis", "ratio")
 	fmt.Println(strings.Repeat("─", 90))
 
 	if rResult.opsPerSec > 0 {
 		ratio := mResult.opsPerSec / rResult.opsPerSec * 100
-		verdict := "✓"
-		if ratio < 80 {
-			verdict = "✗"
-		} else if ratio < 95 {
-			verdict = "~"
-		}
-		fmt.Printf("  %-15s │ %14.0f │ %14.0f │ %7.0f%% %s\n",
-			"throughput ops/s", mResult.opsPerSec, rResult.opsPerSec, ratio, verdict)
+		mark := verdict(ratio)
+		fmt.Printf("  %-18s │ %14.0f │ %14.0f │ %7.0f%% %s\n",
+			"throughput (ops/s)", mResult.opsPerSec, rResult.opsPerSec, ratio, mark)
 	}
-	if mResult.avgLatUs > 0 {
-		fmt.Printf("  %-15s │ %12.0fμs │ %12.0fμs │ %10s\n",
-			"avg latency", mResult.avgLatUs, rResult.avgLatUs, "")
+	if mResult.avgUs > 0 && rResult.avgUs > 0 {
+		fmt.Printf("  %-18s │ %12.0fμs │ %12.0fμs │ %10s\n",
+			"avg latency", mResult.avgUs, rResult.avgUs, "")
 	}
-	if mResult.p50LatUs > 0 {
-		fmt.Printf("  %-15s │ %12.0fμs │ %12.0fμs │ %10s\n",
-			"p50 latency", mResult.p50LatUs, rResult.p50LatUs, "")
+	if mResult.p50Us > 0 && rResult.p50Us > 0 {
+		fmt.Printf("  %-18s │ %12.0fμs │ %12.0fμs │ %10s\n",
+			"p50 latency", mResult.p50Us, rResult.p50Us, "")
 	}
-	if mResult.p99LatUs > 0 {
-		fmt.Printf("  %-15s │ %12.0fμs │ %12.0fμs │ %10s\n",
-			"p99 latency", mResult.p99LatUs, rResult.p99LatUs, "")
+	if mResult.p99Us > 0 && rResult.p99Us > 0 {
+		fmt.Printf("  %-18s │ %12.0fμs │ %12.0fμs │ %10s\n",
+			"p99 latency", mResult.p99Us, rResult.p99Us, "")
 	}
 	fmt.Println(strings.Repeat("─", 90))
-
-	printVerdict(mResult, rResult)
+	if rResult.opsPerSec > 0 {
+		ratio := mResult.opsPerSec / rResult.opsPerSec
+		switch {
+		case ratio >= 0.95:
+			fmt.Printf("  ✓ mcache matches Redis (%.0f%%)\n", ratio*100)
+		case ratio >= 0.80:
+			fmt.Printf("  ~ mcache at %.0f%% of Redis\n", ratio*100)
+		default:
+			fmt.Printf("  ✗ mcache at %.0f%% of Redis\n", ratio*100)
+		}
+	}
 	fmt.Println(strings.Repeat("=", 90))
 }
 
-type benchConfig struct {
-	mcacheAddr, redisAddr     string
-	mode                      string
-	keySize, valSize          int
-	totalOps, goroutines      int
-	pipelineSize              int
-	readRatio                 float64
-	keySpace                  int
-}
-
-type benchResult struct {
+type result struct {
 	opsPerSec float64
-	avgLatUs  float64
-	p50LatUs  float64
-	p99LatUs  float64
+	avgUs     float64
+	p50Us     float64
+	p99Us     float64
 }
 
-// mcacheServerStats mirrors net.ServerStats for JSON parsing.
-type mcacheServerStats struct {
-	UptimeMs      int64  `json:"uptime_ms"`
-	Connections   int    `json:"connections"`
-	TotalRequests uint64 `json:"total_requests"`
-	CacheEntries  int    `json:"cache_entries"`
-	CacheMemory   uint64 `json:"cache_memory"`
-	MemoryLimit   uint64 `json:"memory_limit"`
-	Goroutines    int    `json:"goroutines"`
-	Value         []byte `json:"-"` // raw JSON
-}
+// ---------------------------------------------------------------------------
+// mcache benchmark — EXACT same logic as bench_mcache/main.go benchSet/benchGet/benchMix
+// ---------------------------------------------------------------------------
 
-func fetchMcacheStats(addr string) mcacheServerStats {
-	transport, err := mnet.NewClient(addr, mnet.WithPoolSize(1),
-		mnet.WithDialTimeout(2*time.Second),
-		mnet.WithClientReadTimeout(2*time.Second),
-		mnet.WithClientWriteTimeout(2*time.Second))
-	if err != nil {
-		return mcacheServerStats{}
-	}
-	defer transport.Close()
-
-	data, err := transport.Stats()
-	if err != nil {
-		return mcacheServerStats{}
-	}
-
-	var stats mcacheServerStats
-	if err := json.Unmarshal(data, &stats); err != nil {
-		return mcacheServerStats{}
-	}
-	stats.Value = data
-	return stats
-}
-
-func printMcacheState(label string, stats mcacheServerStats) {
-	if stats.Value == nil {
-		fmt.Printf("%s  (server unreachable)\n", label)
-		return
-	}
-	uptime := time.Duration(stats.UptimeMs) * time.Millisecond
-	fmt.Printf("%s  uptime=%v  conns=%d  entries=%d  mem=%s  goroutines=%d  reqs=%d\n",
-		label, uptime.Round(time.Second), stats.Connections, stats.CacheEntries,
-		formatBytes(int(stats.CacheMemory)), stats.Goroutines, stats.TotalRequests)
-}
-
-func benchMcache(cfg benchConfig) benchResult {
-	c, err := sdk.NewClient(cfg.mcacheAddr, sdk.WithPoolSize(cfg.goroutines), sdk.WithCodec(sdk.RawCodec{}))
+func runMcache(addr, mode string, ks, vs, totalOps, goroutines, pipelineSize int, readRatio float64, keySpace int) result {
+	c, err := sdk.NewClient(addr, sdk.WithPoolSize(goroutines), sdk.WithCodec(sdk.RawCodec{}))
 	if err != nil {
 		fmt.Printf("  mcache connect error: %v\n", err)
-		return benchResult{}
+		return result{}
 	}
 	defer c.Close()
 
-	opsPerG := cfg.totalOps / cfg.goroutines
-	var totalOpsDone int64
-	lats := make([]time.Duration, cfg.totalOps)
-	var wg sync.WaitGroup
-	var ready sync.WaitGroup
-	start := make(chan struct{})
-	ready.Add(cfg.goroutines)
-
-	if cfg.mode == "get" || cfg.mode == "mix" {
-		fmt.Printf("  populating mcache with %d keys...\n", cfg.keySpace)
-		val := fillBytes(make([]byte, cfg.valSize))
-		for i := 0; i < cfg.keySpace; i++ {
-			_ = c.Set(genKey(nil, i, cfg.keySize), val, 0)
+	if mode == "get" || mode == "mix" {
+		fmt.Printf("  populating mcache with %d keys...\n", keySpace)
+		val := fillBytes(make([]byte, vs))
+		for i := 0; i < keySpace; i++ {
+			_ = c.Set(genKey(nil, i, ks), val, 0)
+		}
+		if mode == "get" {
+			fmt.Println("  running GET benchmark...")
+		} else {
+			fmt.Println("  running MIX benchmark...")
 		}
 	}
 
-	batchSz := cfg.pipelineSize
-	if batchSz <= 0 {
-		batchSz = 1
-	}
+	opsPerG := totalOps / goroutines
+	lats := make([]time.Duration, totalOps)
+	var wg sync.WaitGroup
+	var ready sync.WaitGroup
+	start := make(chan struct{})
+	ready.Add(goroutines)
 
-	for gid := 0; gid < cfg.goroutines; gid++ {
-		wg.Add(1)
-		go func(gid int) {
-			defer wg.Done()
-			rng := rand.New(rand.NewSource(int64(gid)))
-			val := fillBytes(make([]byte, cfg.valSize))
-			p := c.Pipeline()
-			ready.Done()
-			<-start
-			base := gid * opsPerG
-
-			i := 0
-			for i < opsPerG {
-				end := min(i+batchSz, opsPerG)
-				for j := i; j < end; j++ {
-					k := genKey(nil, rng.Intn(cfg.keySpace), cfg.keySize)
-					switch cfg.mode {
+	if pipelineSize > 0 {
+		batchSz := pipelineSize
+		for gid := 0; gid < goroutines; gid++ {
+			wg.Add(1)
+			go func(gid int) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(int64(gid)))
+				val := fillBytes(make([]byte, vs))
+				pipeline := c.Pipeline()
+				ready.Done()
+				<-start
+				base := gid * opsPerG
+				for i := 0; i < opsPerG; {
+					end := min(i+batchSz, opsPerG)
+					for j := i; j < end; j++ {
+						k := genKey(nil, rng.Intn(keySpace), ks)
+						switch mode {
+						case "get":
+							pipeline.AddGet(k)
+						case "mix":
+							if rng.Float64() < readRatio {
+								pipeline.AddGet(k)
+							} else {
+								pipeline.AddSet(k, val, 0)
+							}
+						default:
+							pipeline.AddSet(k, val, 0)
+						}
+					}
+					t0 := time.Now()
+					switch mode {
 					case "get":
-						p.AddGet(k)
+						dests := make([]any, end-i)
+						for j := range dests {
+							var v []byte
+							dests[j] = &v
+						}
+						pipeline.FlushGets(dests)
 					case "mix":
-						if rng.Float64() < cfg.readRatio {
-							p.AddGet(k)
+						pipeline.Flush()
+					default:
+						pipeline.FlushSets()
+					}
+					elapsed := time.Since(t0)
+					perOp := elapsed / time.Duration(end-i)
+					for j := i; j < end; j++ {
+						lats[base+j] = perOp
+					}
+					pipeline.Reset()
+					i = end
+				}
+			}(gid)
+		}
+	} else {
+		for gid := 0; gid < goroutines; gid++ {
+			wg.Add(1)
+			go func(gid int) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(int64(gid)))
+				key := make([]byte, ks)
+				val := fillBytes(make([]byte, vs))
+				ready.Done()
+				<-start
+				base := gid * opsPerG
+				for i := 0; i < opsPerG; i++ {
+					k := genKey(key, rng.Intn(keySpace), ks)
+					t0 := time.Now()
+					switch mode {
+					case "get":
+						var v []byte
+						_ = c.Get(k, &v)
+					case "mix":
+						if rng.Float64() < readRatio {
+							var v []byte
+							_ = c.Get(k, &v)
 						} else {
-							p.AddSet(k, val, 0)
+							_ = c.Set(k, val, 0)
 						}
 					default:
-						p.AddSet(k, val, 0)
+						_ = c.Set(k, val, 0)
 					}
+					lats[base+i] = time.Since(t0)
 				}
-				batchStart := time.Now()
-				switch cfg.mode {
-				case "get":
-					dests := make([]any, end-i)
-					for j := range dests {
-						var v []byte
-						dests[j] = &v
-					}
-					_ = p.FlushGets(dests)
-				case "mix":
-					_, _ = p.Flush()
-				default:
-					_ = p.FlushSets()
-				}
-				elapsed := time.Since(batchStart)
-				perOp := elapsed / time.Duration(end-i)
-				for j := i; j < end; j++ {
-					lats[base+j] = perOp
-				}
-				totalOpsDone += int64(end - i)
-				p.Reset()
-				i = end
-			}
-		}(gid)
+			}(gid)
+		}
 	}
 
 	ready.Wait()
-	wallStart := time.Now()
+	t0 := time.Now()
 	close(start)
 	wg.Wait()
-	wallElapsed := time.Since(wallStart).Seconds()
+	elapsed := time.Since(t0).Seconds()
 
-	return buildResult(lats, cfg.totalOps, wallElapsed)
+	return buildResult(lats, totalOps, elapsed)
 }
 
-func benchRedis(cfg benchConfig) benchResult {
+// ---------------------------------------------------------------------------
+// Redis benchmark — same logic as bench_redis/main.go
+// ---------------------------------------------------------------------------
+
+func runRedis(addr, mode string, ks, vs, totalOps, goroutines int, readRatio float64, keySpace int) result {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:         cfg.redisAddr,
-		PoolSize:     cfg.goroutines,
+		Addr:         addr,
+		PoolSize:     goroutines,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	})
 	defer rdb.Close()
 	ctx := context.Background()
 
-	if cfg.mode == "get" || cfg.mode == "mix" {
-		fmt.Printf("  populating redis with %d keys...\n", cfg.keySpace)
-		val := fillBytes(make([]byte, cfg.valSize))
+	if mode == "get" || mode == "mix" {
+		fmt.Printf("  populating redis with %d keys...\n", keySpace)
+		val := fillBytes(make([]byte, vs))
 		pipe := rdb.Pipeline()
-		for i := 0; i < cfg.keySpace; i++ {
-			pipe.Set(ctx, genKey(nil, i, cfg.keySize), val, 0)
+		for i := 0; i < keySpace; i++ {
+			pipe.Set(ctx, genKey(nil, i, ks), val, 0)
 		}
 		_, _ = pipe.Exec(ctx)
 	}
 
-	opsPerG := cfg.totalOps / cfg.goroutines
-	lats := make([]time.Duration, cfg.totalOps)
+	opsPerG := totalOps / goroutines
+	lats := make([]time.Duration, totalOps)
 	var wg sync.WaitGroup
 	var ready sync.WaitGroup
 	start := make(chan struct{})
-	ready.Add(cfg.goroutines)
+	ready.Add(goroutines)
 
-	for gid := 0; gid < cfg.goroutines; gid++ {
+	for gid := 0; gid < goroutines; gid++ {
 		wg.Add(1)
 		go func(gid int) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(int64(gid)))
-			val := fillBytes(make([]byte, cfg.valSize))
+			val := fillBytes(make([]byte, vs))
 			ready.Done()
 			<-start
 			base := gid * opsPerG
 			for i := 0; i < opsPerG; i++ {
-				k := genKey(nil, rng.Intn(cfg.keySpace), cfg.keySize)
+				k := genKey(nil, rng.Intn(keySpace), ks)
 				t0 := time.Now()
-				switch cfg.mode {
+				switch mode {
 				case "get":
 					_ = rdb.Get(ctx, k).Err()
 				case "mix":
-					if rng.Float64() < cfg.readRatio {
+					if rng.Float64() < readRatio {
 						_ = rdb.Get(ctx, k).Err()
 					} else {
 						_ = rdb.Set(ctx, k, val, 0).Err()
@@ -354,63 +323,33 @@ func benchRedis(cfg benchConfig) benchResult {
 	}
 
 	ready.Wait()
-	wallStart := time.Now()
+	t0 := time.Now()
 	close(start)
 	wg.Wait()
-	wallElapsed := time.Since(wallStart).Seconds()
+	elapsed := time.Since(t0).Seconds()
 
-	return buildResult(lats, cfg.totalOps, wallElapsed)
+	return buildResult(lats, totalOps, elapsed)
 }
 
-func buildResult(lats []time.Duration, totalOps int, elapsed float64) benchResult {
-	n := len(lats)
-	if n == 0 || elapsed <= 0 {
-		return benchResult{}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func buildResult(lats []time.Duration, totalOps int, elapsed float64) result {
+	if len(lats) == 0 || elapsed <= 0 {
+		return result{}
 	}
-
-	// Sort for percentiles
-	sorted := make([]time.Duration, n)
-	copy(sorted, lats)
-	sortDurations(sorted)
-
+	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
+	n := len(lats)
 	var sum int64
 	for _, d := range lats {
 		sum += int64(d)
 	}
-
-	return benchResult{
+	return result{
 		opsPerSec: float64(totalOps) / elapsed,
-		avgLatUs:  float64(sum/int64(time.Microsecond)) / float64(n),
-		p50LatUs:  float64(sorted[n*50/100] / time.Microsecond),
-		p99LatUs:  float64(sorted[n*99/100] / time.Microsecond),
-	}
-}
-
-func sortDurations(a []time.Duration) {
-	for i := 0; i < len(a); i++ {
-		for j := i + 1; j < len(a); j++ {
-			if a[i] > a[j] {
-				a[i], a[j] = a[j], a[i]
-			}
-		}
-	}
-}
-
-func printVerdict(m, r benchResult) {
-	if r.opsPerSec <= 0 {
-		fmt.Println("  ⚠ Redis unreachable — cannot compare")
-		return
-	}
-	ratio := m.opsPerSec / r.opsPerSec
-	switch {
-	case ratio >= 0.95:
-		fmt.Printf("  ✓ mcache matches Redis (%.0f%%)\n", ratio*100)
-	case ratio >= 0.80:
-		fmt.Printf("  ~ mcache at %.0f%% of Redis — try --pipeline 32\n", ratio*100)
-	case ratio >= 0.50:
-		fmt.Printf("  ✗ mcache at %.0f%% of Redis — check TCP_NODELAY and server build\n", ratio*100)
-	default:
-		fmt.Printf("  ✗✗ mcache only %.0f%% of Redis — server may be unoptimized\n", ratio*100)
+		avgUs:     float64(sum/int64(time.Microsecond)) / float64(n),
+		p50Us:     float64(lats[n*50/100] / time.Microsecond),
+		p99Us:     float64(lats[n*99/100] / time.Microsecond),
 	}
 }
 
@@ -434,6 +373,49 @@ func fillBytes(b []byte) []byte {
 		b[i] = 'x'
 	}
 	return b
+}
+
+func verdict(ratio float64) string {
+	if ratio >= 0.95 {
+		return "✓"
+	} else if ratio >= 0.80 {
+		return "~"
+	}
+	return "✗"
+}
+
+// --- Server stats query (uses direct mnet.Client, independent of benchmark) ---
+
+func printMcacheState(label, addr string) {
+	fmt.Printf("%s ", label)
+	transport, err := mnet.NewClient(addr,
+		mnet.WithPoolSize(1),
+		mnet.WithDialTimeout(2*time.Second),
+		mnet.WithClientReadTimeout(2*time.Second),
+		mnet.WithClientWriteTimeout(2*time.Second))
+	if err != nil {
+		fmt.Println("(unreachable)")
+		return
+	}
+	data, err := transport.Stats()
+	transport.Close()
+	if err != nil {
+		fmt.Println("(stats failed)")
+		return
+	}
+	var s struct {
+		UptimeMs      int64  `json:"uptime_ms"`
+		Connections   int    `json:"connections"`
+		CacheEntries  int    `json:"cache_entries"`
+		CacheMemory   uint64 `json:"cache_memory"`
+		Goroutines    int    `json:"goroutines"`
+		TotalRequests uint64 `json:"total_requests"`
+	}
+	json.Unmarshal(data, &s)
+	uptime := time.Duration(s.UptimeMs) * time.Millisecond
+	fmt.Printf("uptime=%v  conns=%d  entries=%d  mem=%s  goroutines=%d  reqs=%d\n",
+		uptime.Round(time.Second), s.Connections, s.CacheEntries,
+		formatBytes(int(s.CacheMemory)), s.Goroutines, s.TotalRequests)
 }
 
 func formatBytes(n int) string {
