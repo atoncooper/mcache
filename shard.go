@@ -82,9 +82,18 @@ func newShard(policyFactory func() EvictionPolicy, maxSize int, observer CacheOb
 	return s
 }
 
-// subIndex maps a key to a sub-shard index using byte sampling (faster than full FNV).
+// subIndex maps a key to a sub-shard index. Samples middle bytes for long keys,
+// or first/last bytes for short keys, to avoid degenerate uniform prefix/suffix.
 func (s *shard) subIndex(key string) int {
-	return (int(key[0])*31 ^ int(key[len(key)-1])) % s.numSubs
+	n := len(key)
+	switch {
+	case n >= 8:
+		return (int(key[n/2-1])*31 ^ int(key[n/2])) % s.numSubs
+	case n >= 2:
+		return (int(key[0])*31 ^ int(key[n-1])) % s.numSubs
+	default:
+		return int(key[0]) % s.numSubs
+	}
 }
 
 // --- KV operations (hot path — routed to sub-shard) ---
