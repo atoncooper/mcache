@@ -329,8 +329,8 @@ func TestEviction_LRU_Basic(t *testing.T) {
 		t.Fatalf("expected len=3, got %d", c.Len())
 	}
 
-	// "a" is now most-recently-used.
-	c.Get("a")
+	// Re-set "a" to promote it (approximate LRU: only Set updates order).
+	c.Set("a", []byte("1"))
 
 	// Adding "d" should evict "b" (least recently used: b was not touched).
 	c.Set("d", []byte("4"))
@@ -355,8 +355,8 @@ func TestEviction_LRU_AccessOrder(t *testing.T) {
 	c.Set("a", []byte("1"))
 	c.Set("b", []byte("2"))
 
-	// Promote "a" to MRU.
-	c.Get("a")
+	// Re-set "a" to promote it (approximate LRU: only Set updates order).
+	c.Set("a", []byte("1"))
 
 	// Add "c"; "b" is LRU and should be evicted.
 	c.Set("c", []byte("3"))
@@ -364,8 +364,8 @@ func TestEviction_LRU_AccessOrder(t *testing.T) {
 		t.Errorf("expected b evicted, got %v", err)
 	}
 
-	// Promote "c" to MRU, then add "d"; "a" should be evicted.
-	c.Get("c")
+	// Re-set "c" to promote it, then add "d"; "a" should be evicted.
+	c.Set("c", []byte("3"))
 	c.Set("d", []byte("4"))
 	if _, err := c.Get("a"); err != ErrKeyNotFound {
 		t.Errorf("expected a evicted, got %v", err)
@@ -385,10 +385,11 @@ func TestEviction_LFU_Basic(t *testing.T) {
 	c.Set("b", []byte("2"))
 	c.Set("c", []byte("3"))
 
-	// Build frequency skew: a=3, b=2, c=1.
-	c.Get("a")
-	c.Get("a")
-	c.Get("b")
+	// Build frequency skew (approximate LFU: only Set bumps frequency).
+	// a=3, b=2, c=1
+	c.Set("a", []byte("1"))
+	c.Set("a", []byte("1"))
+	c.Set("b", []byte("2"))
 
 	// Add "d". Lowest freq is c (freq=1), so c should be evicted.
 	c.Set("d", []byte("4"))
@@ -442,10 +443,10 @@ func TestEviction_PolicySwap(t *testing.T) {
 	}
 
 	// All keys reset to freq=1 after swap.
-	// Bump a twice, b once.
-	c.Get("a")
-	c.Get("a")
-	c.Get("b")
+	// Re-set to bump frequency: a twice, b once (approximate LFU).
+	c.Set("a", []byte("1"))
+	c.Set("a", []byte("1"))
+	c.Set("b", []byte("2"))
 
 	// Adding d should evict c (lowest freq=1, oldest).
 	c.Set("d", []byte("4"))
@@ -457,9 +458,9 @@ func TestEviction_PolicySwap(t *testing.T) {
 	if err := c.SetEvictionPolicy("lru"); err != nil {
 		t.Fatalf("swap to lru failed: %v", err)
 	}
-	// Promote a and d to MRU so b is the only untouched key (LRU).
-	c.Get("a")
-	c.Get("d")
+	// Re-set a and d to promote them so b is the only untouched key.
+	c.Set("a", []byte("1"))
+	c.Set("d", []byte("4"))
 	c.Set("e", []byte("5"))
 	if _, err := c.Get("b"); err != ErrKeyNotFound {
 		t.Errorf("expected b evicted after lru swap, got %v", err)

@@ -4,7 +4,29 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 )
+
+// bufPool reuses byte buffers for frame encode/decode on the hot path.
+// Only buffers up to 4 KB are pooled; larger allocations go to the GC.
+var bufPool = sync.Pool{New: func() any { return make([]byte, 0, 256) }}
+
+func getBuf(size int) []byte {
+	if size > 4096 {
+		return make([]byte, size)
+	}
+	buf := bufPool.Get().([]byte)
+	if cap(buf) >= size {
+		return buf[:size]
+	}
+	return make([]byte, size)
+}
+
+func putBuf(buf []byte) {
+	if cap(buf) <= 4096 {
+		bufPool.Put(buf[:0])
+	}
+}
 
 const (
 	FrameTypeRequest  byte = 0
@@ -115,7 +137,8 @@ type Request struct {
 func (req *Request) EncodePayload() []byte {
 	keyLen := len(req.Key)
 	valLen := len(req.Value)
-	payload := make([]byte, 1+2+4+8+keyLen+valLen)
+	size := 1 + 2 + 4 + 8 + keyLen + valLen
+	payload := getBuf(size)
 	payload[0] = req.Cmd
 	binary.BigEndian.PutUint16(payload[1:3], uint16(keyLen))
 	binary.BigEndian.PutUint32(payload[3:7], uint32(valLen))
@@ -161,7 +184,8 @@ type Response struct {
 func (resp *Response) EncodePayload() []byte {
 	valLen := len(resp.Value)
 	errLen := len(resp.ErrMsg)
-	payload := make([]byte, 1+4+2+valLen+errLen)
+	size := 1 + 4 + 2 + valLen + errLen
+	payload := getBuf(size)
 	payload[0] = resp.Status
 	binary.BigEndian.PutUint32(payload[1:5], uint32(valLen))
 	binary.BigEndian.PutUint16(payload[5:7], uint16(errLen))

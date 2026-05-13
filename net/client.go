@@ -10,6 +10,13 @@ import (
 	"github.com/atoncooper/mcache"
 )
 
+var (
+	respChPool     = sync.Pool{New: func() any { return make(chan *Response, 1) }}
+	setRespChPool  = sync.Pool{New: func() any { return make(chan *SetResponse, 1) }}
+	hashRespChPool = sync.Pool{New: func() any { return make(chan *HashResponse, 1) }}
+	listRespChPool = sync.Pool{New: func() any { return make(chan *ListResponse, 1) }}
+)
+
 // Client is a high-concurrency multiplexed TCP client.
 // It maintains a pool of connections; each connection supports concurrent
 // in-flight requests via stream IDs.
@@ -24,16 +31,15 @@ type Client struct {
 
 // clientConn is a single TCP connection that multiplexes multiple requests.
 type clientConn struct {
-	netConn      net.Conn
-	nextStreamID uint32 // atomic
-	pending      map[uint32]chan *Response
-	pendingSet   map[uint32]chan *SetResponse
-	pendingHash  map[uint32]chan *HashResponse
-	pendingList  map[uint32]chan *ListResponse
-	pendingMu    sync.Mutex
-	writeMu      sync.Mutex
-	closed       atomic.Bool
-	readErr      atomic.Value
+	netConn        net.Conn
+	nextStreamID   uint32 // atomic
+	pendingMap     sync.Map // uint32 -> chan *Response
+	pendingSetMap  sync.Map // uint32 -> chan *SetResponse
+	pendingHashMap sync.Map // uint32 -> chan *HashResponse
+	pendingListMap sync.Map // uint32 -> chan *ListResponse
+	writeMu        sync.Mutex
+	closed         atomic.Bool
+	readErr        atomic.Value
 }
 
 // ClientOption configures a Client.
@@ -100,11 +106,7 @@ func (c *Client) dial(addr string) (*clientConn, error) {
 		return nil, err
 	}
 	return &clientConn{
-		netConn:     conn,
-		pending:     make(map[uint32]chan *Response),
-		pendingSet:  make(map[uint32]chan *SetResponse),
-		pendingHash: make(map[uint32]chan *HashResponse),
-		pendingList: make(map[uint32]chan *ListResponse),
+		netConn: conn,
 	}, nil
 }
 
@@ -245,21 +247,23 @@ func (cc *clientConn) do(req *Request, readTimeout, writeTimeout time.Duration) 
 		streamID = atomic.AddUint32(&cc.nextStreamID, 1)
 	}
 
-	respCh := make(chan *Response, 1)
-	cc.pendingMu.Lock()
-	cc.pending[streamID] = respCh
-	cc.pendingMu.Unlock()
+	respCh := respChPool.Get().(chan *Response)
+	cc.pendingMap.Store(streamID, respCh)
 
 	defer func() {
-		cc.pendingMu.Lock()
-		delete(cc.pending, streamID)
-		cc.pendingMu.Unlock()
+		cc.pendingMap.Delete(streamID)
+		select {
+		case <-respCh:
+		default:
+		}
+		respChPool.Put(respCh)
 	}()
 
+	payload := req.EncodePayload()
 	frame := &Frame{
 		StreamID: streamID,
 		Type:     FrameTypeRequest,
-		Payload:  req.EncodePayload(),
+		Payload:  payload,
 	}
 
 	if writeTimeout > 0 {
@@ -268,16 +272,19 @@ func (cc *clientConn) do(req *Request, readTimeout, writeTimeout time.Duration) 
 	cc.writeMu.Lock()
 	err := frame.Encode(cc.netConn)
 	cc.writeMu.Unlock()
+	putBuf(payload)
 	if err != nil {
 		cc.markBad()
 		return nil, err
 	}
 
 	if readTimeout > 0 {
+		timer := time.NewTimer(readTimeout)
+		defer timer.Stop()
 		select {
 		case resp := <-respCh:
 			return resp, nil
-		case <-time.After(readTimeout):
+		case <-timer.C:
 			return nil, ErrReadTimeout
 		}
 	}
@@ -312,14 +319,12 @@ func (cc *clientConn) readLoop() {
 				if err != nil {
 					hResp = &HashResponse{Status: StatusErr, ErrMsg: "malformed hash response"}
 				}
-				cc.pendingMu.Lock()
-				ch, ok := cc.pendingHash[frame.StreamID]
-				cc.pendingMu.Unlock()
+				v, ok := cc.pendingHashMap.Load(frame.StreamID)
 				if !ok {
 					continue
 				}
 				select {
-				case ch <- hResp:
+				case v.(chan *HashResponse) <- hResp:
 				default:
 				}
 			case IsListCmd(cmd):
@@ -327,14 +332,12 @@ func (cc *clientConn) readLoop() {
 				if err != nil {
 					lResp = &ListResponse{Status: StatusErr, ErrMsg: "malformed list response"}
 				}
-				cc.pendingMu.Lock()
-				ch, ok := cc.pendingList[frame.StreamID]
-				cc.pendingMu.Unlock()
+				v, ok := cc.pendingListMap.Load(frame.StreamID)
 				if !ok {
 					continue
 				}
 				select {
-				case ch <- lResp:
+				case v.(chan *ListResponse) <- lResp:
 				default:
 				}
 			case cmd >= CmdSAdd && cmd <= CmdSDiff:
@@ -342,14 +345,12 @@ func (cc *clientConn) readLoop() {
 				if err != nil {
 					sResp = &SetResponse{Status: StatusErr, ErrMsg: "malformed set response"}
 				}
-				cc.pendingMu.Lock()
-				ch, ok := cc.pendingSet[frame.StreamID]
-				cc.pendingMu.Unlock()
+				v, ok := cc.pendingSetMap.Load(frame.StreamID)
 				if !ok {
 					continue
 				}
 				select {
-				case ch <- sResp:
+				case v.(chan *SetResponse) <- sResp:
 				default:
 				}
 			default:
@@ -357,14 +358,12 @@ func (cc *clientConn) readLoop() {
 				if err != nil {
 					resp = &Response{Status: StatusErr, ErrMsg: "malformed response"}
 				}
-				cc.pendingMu.Lock()
-				ch, ok := cc.pending[frame.StreamID]
-				cc.pendingMu.Unlock()
+				v, ok := cc.pendingMap.Load(frame.StreamID)
 				if !ok {
 					continue
 				}
 				select {
-				case ch <- resp:
+				case v.(chan *Response) <- resp:
 				default:
 				}
 			}
@@ -373,36 +372,38 @@ func (cc *clientConn) readLoop() {
 }
 
 func (cc *clientConn) closeAllPending(err error) {
-	cc.pendingMu.Lock()
-	defer cc.pendingMu.Unlock()
-	for _, ch := range cc.pending {
+	cc.pendingMap.Range(func(key, value any) bool {
 		select {
-		case ch <- &Response{Status: StatusErr, ErrMsg: err.Error()}:
+		case value.(chan *Response) <- &Response{Status: StatusErr, ErrMsg: err.Error()}:
 		default:
 		}
-	}
-	for _, ch := range cc.pendingSet {
+		cc.pendingMap.Delete(key)
+		return true
+	})
+	cc.pendingSetMap.Range(func(key, value any) bool {
 		select {
-		case ch <- &SetResponse{Cmd: 0, Status: StatusErr, ErrMsg: err.Error()}:
+		case value.(chan *SetResponse) <- &SetResponse{Cmd: 0, Status: StatusErr, ErrMsg: err.Error()}:
 		default:
 		}
-	}
-	for _, ch := range cc.pendingHash {
+		cc.pendingSetMap.Delete(key)
+		return true
+	})
+	cc.pendingHashMap.Range(func(key, value any) bool {
 		select {
-		case ch <- &HashResponse{Status: StatusErr, ErrMsg: err.Error()}:
+		case value.(chan *HashResponse) <- &HashResponse{Status: StatusErr, ErrMsg: err.Error()}:
 		default:
 		}
-	}
-	for _, ch := range cc.pendingList {
+		cc.pendingHashMap.Delete(key)
+		return true
+	})
+	cc.pendingListMap.Range(func(key, value any) bool {
 		select {
-		case ch <- &ListResponse{Status: StatusErr, ErrMsg: err.Error()}:
+		case value.(chan *ListResponse) <- &ListResponse{Status: StatusErr, ErrMsg: err.Error()}:
 		default:
 		}
-	}
-	cc.pending = make(map[uint32]chan *Response)
-	cc.pendingSet = make(map[uint32]chan *SetResponse)
-	cc.pendingHash = make(map[uint32]chan *HashResponse)
-	cc.pendingList = make(map[uint32]chan *ListResponse)
+		cc.pendingListMap.Delete(key)
+		return true
+	})
 }
 
 func (cc *clientConn) markBad() {
@@ -462,15 +463,16 @@ func (cc *clientConn) doSet(req *SetRequest, readTimeout, writeTimeout time.Dura
 		streamID = atomic.AddUint32(&cc.nextStreamID, 1)
 	}
 
-	respCh := make(chan *SetResponse, 1)
-	cc.pendingMu.Lock()
-	cc.pendingSet[streamID] = respCh
-	cc.pendingMu.Unlock()
+	respCh := setRespChPool.Get().(chan *SetResponse)
+	cc.pendingSetMap.Store(streamID, respCh)
 
 	defer func() {
-		cc.pendingMu.Lock()
-		delete(cc.pendingSet, streamID)
-		cc.pendingMu.Unlock()
+		cc.pendingSetMap.Delete(streamID)
+		select {
+		case <-respCh:
+		default:
+		}
+		setRespChPool.Put(respCh)
 	}()
 
 	payload := EncodeSetRequest(req)
@@ -485,16 +487,19 @@ func (cc *clientConn) doSet(req *SetRequest, readTimeout, writeTimeout time.Dura
 	cc.writeMu.Lock()
 	err := frame.Encode(cc.netConn)
 	cc.writeMu.Unlock()
+	putBuf(payload)
 	if err != nil {
 		cc.markBad()
 		return nil, err
 	}
 
 	if readTimeout > 0 {
+		timer := time.NewTimer(readTimeout)
+		defer timer.Stop()
 		select {
 		case resp := <-respCh:
 			return resp, nil
-		case <-time.After(readTimeout):
+		case <-timer.C:
 			return nil, ErrReadTimeout
 		}
 	}

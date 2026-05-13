@@ -169,15 +169,16 @@ func (cc *clientConn) doHash(req *HashRequest, readTimeout, writeTimeout time.Du
 		streamID = atomic.AddUint32(&cc.nextStreamID, 1)
 	}
 
-	respCh := make(chan *HashResponse, 1)
-	cc.pendingMu.Lock()
-	cc.pendingHash[streamID] = respCh
-	cc.pendingMu.Unlock()
+	respCh := hashRespChPool.Get().(chan *HashResponse)
+	cc.pendingHashMap.Store(streamID, respCh)
 
 	defer func() {
-		cc.pendingMu.Lock()
-		delete(cc.pendingHash, streamID)
-		cc.pendingMu.Unlock()
+		cc.pendingHashMap.Delete(streamID)
+		select {
+		case <-respCh:
+		default:
+		}
+		hashRespChPool.Put(respCh)
 	}()
 
 	payload := EncodeHashRequest(req)
@@ -192,16 +193,19 @@ func (cc *clientConn) doHash(req *HashRequest, readTimeout, writeTimeout time.Du
 	cc.writeMu.Lock()
 	err := frame.Encode(cc.netConn)
 	cc.writeMu.Unlock()
+	putBuf(payload)
 	if err != nil {
 		cc.markBad()
 		return nil, err
 	}
 
 	if readTimeout > 0 {
+		timer := time.NewTimer(readTimeout)
+		defer timer.Stop()
 		select {
 		case resp := <-respCh:
 			return resp, nil
-		case <-time.After(readTimeout):
+		case <-timer.C:
 			return nil, ErrReadTimeout
 		}
 	}
@@ -379,15 +383,16 @@ func (cc *clientConn) doList(req *ListRequest, readTimeout, writeTimeout time.Du
 		streamID = atomic.AddUint32(&cc.nextStreamID, 1)
 	}
 
-	respCh := make(chan *ListResponse, 1)
-	cc.pendingMu.Lock()
-	cc.pendingList[streamID] = respCh
-	cc.pendingMu.Unlock()
+	respCh := listRespChPool.Get().(chan *ListResponse)
+	cc.pendingListMap.Store(streamID, respCh)
 
 	defer func() {
-		cc.pendingMu.Lock()
-		delete(cc.pendingList, streamID)
-		cc.pendingMu.Unlock()
+		cc.pendingListMap.Delete(streamID)
+		select {
+		case <-respCh:
+		default:
+		}
+		listRespChPool.Put(respCh)
 	}()
 
 	payload := EncodeListRequest(req)
@@ -402,16 +407,19 @@ func (cc *clientConn) doList(req *ListRequest, readTimeout, writeTimeout time.Du
 	cc.writeMu.Lock()
 	err := frame.Encode(cc.netConn)
 	cc.writeMu.Unlock()
+	putBuf(payload)
 	if err != nil {
 		cc.markBad()
 		return nil, err
 	}
 
 	if readTimeout > 0 {
+		timer := time.NewTimer(readTimeout)
+		defer timer.Stop()
 		select {
 		case resp := <-respCh:
 			return resp, nil
-		case <-time.After(readTimeout):
+		case <-timer.C:
 			return nil, ErrReadTimeout
 		}
 	}

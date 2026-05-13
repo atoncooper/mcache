@@ -426,14 +426,8 @@ func (s *Server) handleConn(sc *serverConn) {
 			}
 		}
 
-		select {
-		case s.jobCh <- &job{sc: sc, streamID: frame.StreamID, req: kvReq, setReq: setReq, hashReq: hashReq, listReq: listReq}:
-			s.stats.totalRequests.Add(1)
-		default:
-			// Backpressure: job queue is full.
-			resp := &Response{Status: StatusErr, ErrMsg: "server overloaded"}
-			s.writeResponse(sc, frame.StreamID, resp)
-		}
+		s.stats.totalRequests.Add(1)
+		s.processJob(&job{sc: sc, streamID: frame.StreamID, req: kvReq, setReq: setReq, hashReq: hashReq, listReq: listReq})
 	}
 }
 
@@ -479,17 +473,17 @@ func (s *Server) processJob(job *job) {
 	switch {
 	case job.hashReq != nil:
 		raw := s.processHash(job.hashReq)
-		payload = make([]byte, 1+len(raw))
+		payload = getBuf(1 + len(raw))
 		payload[0] = job.hashReq.Cmd
 		copy(payload[1:], raw)
 	case job.listReq != nil:
 		raw := s.processList(job.listReq)
-		payload = make([]byte, 1+len(raw))
+		payload = getBuf(1 + len(raw))
 		payload[0] = job.listReq.Cmd
 		copy(payload[1:], raw)
 	case job.setReq != nil:
 		raw := s.processSet(job.setReq)
-		payload = make([]byte, 1+len(raw))
+		payload = getBuf(1 + len(raw))
 		payload[0] = job.setReq.Cmd
 		copy(payload[1:], raw)
 	default:
@@ -509,13 +503,15 @@ func (s *Server) processJob(job *job) {
 		job.sc.netConn.SetWriteDeadline(time.Time{})
 	}
 	job.sc.writeMu.Unlock()
+	putBuf(payload)
 }
 
 func (s *Server) writeResponse(sc *serverConn, streamID uint32, resp *Response) {
+	payload := resp.EncodePayload()
 	frame := &Frame{
 		StreamID: streamID,
 		Type:     FrameTypeResponse,
-		Payload:  resp.EncodePayload(),
+		Payload:  payload,
 	}
 	sc.writeMu.Lock()
 	if s.writeTimeout > 0 {
@@ -526,6 +522,7 @@ func (s *Server) writeResponse(sc *serverConn, streamID uint32, resp *Response) 
 		sc.netConn.SetWriteDeadline(time.Time{})
 	}
 	sc.writeMu.Unlock()
+	putBuf(payload)
 }
 
 func (s *Server) process(req *Request) *Response {

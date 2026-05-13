@@ -39,7 +39,6 @@ func newShard(policy EvictionPolicy, maxSize int, observer CacheObserver) *shard
 func (s *shard) get(key string) ([]byte, bool) {
 	s.mu.RLock()
 	entry, ok := s.entries[key]
-	policy := s.policy
 	s.mu.RUnlock()
 
 	if !ok {
@@ -54,7 +53,6 @@ func (s *shard) get(key string) ([]byte, bool) {
 		s.mu.Unlock()
 		return nil, false
 	}
-	policy.OnAccess(key)
 	return append([]byte(nil), entry.value...), true
 }
 

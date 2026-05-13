@@ -1,9 +1,6 @@
 package mcache
 
-import (
-	"container/list"
-	"sync"
-)
+import "container/list"
 
 // lfuItem is the node payload in the per-frequency lists.
 type lfuItem struct {
@@ -18,8 +15,8 @@ type lfuItem struct {
 //   - minFreq:  smallest frequency that currently has any items
 //
 // All operations are amortized O(1) except Clear (O(n)).
+// The shard lock protects all policy calls; no internal mutex is needed.
 type LFUPolicy struct {
-	mu        sync.Mutex
 	items     map[string]*list.Element
 	freqLists map[int]*list.List
 	minFreq   int
@@ -37,14 +34,10 @@ func NewLFU() *LFUPolicy {
 func (p *LFUPolicy) Name() string { return "lfu" }
 
 func (p *LFUPolicy) OnAccess(key string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.bump(key)
 }
 
 func (p *LFUPolicy) OnAdd(key string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if _, ok := p.items[key]; ok {
 		p.bump(key)
 		return
@@ -60,8 +53,6 @@ func (p *LFUPolicy) OnAdd(key string) {
 }
 
 func (p *LFUPolicy) OnRemove(key string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	elem, ok := p.items[key]
 	if !ok {
 		return
@@ -74,8 +65,6 @@ func (p *LFUPolicy) OnRemove(key string) {
 // Evict removes and returns the key with the lowest frequency.
 // When multiple keys share the lowest frequency, the oldest one wins.
 func (p *LFUPolicy) Evict() (string, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if len(p.items) == 0 {
 		return "", false
 	}
@@ -95,20 +84,16 @@ func (p *LFUPolicy) Evict() (string, bool) {
 }
 
 func (p *LFUPolicy) Len() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	return len(p.items)
 }
 
 func (p *LFUPolicy) Clear() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.items = make(map[string]*list.Element)
 	p.freqLists = make(map[int]*list.List)
 	p.minFreq = 0
 }
 
-// bump increments the frequency of an existing key. Caller must hold p.mu.
+// bump increments the frequency of an existing key. Caller must hold shard lock.
 func (p *LFUPolicy) bump(key string) {
 	elem, ok := p.items[key]
 	if !ok {
@@ -127,7 +112,7 @@ func (p *LFUPolicy) bump(key string) {
 }
 
 // removeFromBucket removes elem from freqLists[freq] and adjusts minFreq if the
-// bucket becomes empty. Caller must hold p.mu.
+// bucket becomes empty. Caller must hold shard lock.
 func (p *LFUPolicy) removeFromBucket(elem *list.Element, freq int) {
 	bucket := p.freqLists[freq]
 	bucket.Remove(elem)
@@ -140,7 +125,7 @@ func (p *LFUPolicy) removeFromBucket(elem *list.Element, freq int) {
 }
 
 // scanMinFreq finds the smallest frequency with a non-empty bucket.
-// Returns 0 if no buckets remain. Caller must hold p.mu.
+// Returns 0 if no buckets remain. Caller must hold shard lock.
 // O(k) where k is the number of distinct frequencies, which is bounded by Len().
 func (p *LFUPolicy) scanMinFreq() int {
 	if len(p.freqLists) == 0 {

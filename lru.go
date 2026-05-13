@@ -1,15 +1,12 @@
 package mcache
 
-import (
-	"container/list"
-	"sync"
-)
+import "container/list"
 
 // LRUPolicy implements Least Recently Used eviction.
 // Front of the list = most recently used; Back = next to evict.
 // All operations are O(1).
+// The shard lock protects all policy calls; no internal mutex is needed.
 type LRUPolicy struct {
-	mu    sync.Mutex
 	order *list.List
 	nodes map[string]*list.Element
 }
@@ -25,16 +22,12 @@ func NewLRU() *LRUPolicy {
 func (p *LRUPolicy) Name() string { return "lru" }
 
 func (p *LRUPolicy) OnAccess(key string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if e, ok := p.nodes[key]; ok {
 		p.order.MoveToFront(e)
 	}
 }
 
 func (p *LRUPolicy) OnAdd(key string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if e, ok := p.nodes[key]; ok {
 		p.order.MoveToFront(e)
 		return
@@ -43,8 +36,6 @@ func (p *LRUPolicy) OnAdd(key string) {
 }
 
 func (p *LRUPolicy) OnRemove(key string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if e, ok := p.nodes[key]; ok {
 		p.order.Remove(e)
 		delete(p.nodes, key)
@@ -53,8 +44,6 @@ func (p *LRUPolicy) OnRemove(key string) {
 
 // Evict removes and returns the least recently used key, if any.
 func (p *LRUPolicy) Evict() (string, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	e := p.order.Back()
 	if e == nil {
 		return "", false
@@ -66,14 +55,10 @@ func (p *LRUPolicy) Evict() (string, bool) {
 }
 
 func (p *LRUPolicy) Len() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	return p.order.Len()
 }
 
 func (p *LRUPolicy) Clear() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.order.Init()
 	p.nodes = make(map[string]*list.Element)
 }
