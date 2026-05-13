@@ -80,11 +80,19 @@ type job struct {
 	listReq  *ListRequest  // non-nil for list commands
 }
 
-// serverConn wraps a TCP connection. Only the readLoop goroutine reads from
-// it; workers acquire writeMu when sending responses back.
+// responsePayload carries an encoded response ready to write.
+type responsePayload struct {
+	streamID uint32
+	payload  []byte
+}
+
+// serverConn wraps a TCP connection. The read loop goroutine reads frames and
+// processes cache operations; a dedicated write loop goroutine sends responses
+// back, providing read-write overlap per connection.
 type serverConn struct {
 	netConn net.Conn
 	writeMu sync.Mutex
+	writeCh chan *responsePayload
 	srv     *Server
 }
 
@@ -277,6 +285,9 @@ func (s *Server) ListenAndServe(addr string) error {
 			continue
 		}
 
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			tcp.SetNoDelay(true)
+		}
 		s.connMu.Lock()
 		if len(s.conns) >= s.maxConns {
 			s.connMu.Unlock()
@@ -284,7 +295,7 @@ func (s *Server) ListenAndServe(addr string) error {
 			continue
 		}
 		cc := &countingConn{Conn: conn, srv: s}
-		sc := &serverConn{netConn: cc, srv: s}
+		sc := &serverConn{netConn: cc, srv: s, writeCh: make(chan *responsePayload, 64)}
 		s.conns[sc] = struct{}{}
 		curr := len(s.conns)
 		s.connMu.Unlock()
@@ -303,7 +314,8 @@ func (s *Server) ListenAndServe(addr string) error {
 			s.infoLog("connection opened remote=%s", conn.RemoteAddr().String())
 		}
 
-		s.wg.Add(1)
+		s.wg.Add(2)
+		go s.writeLoop(sc)
 		go s.handleConn(sc)
 	}
 }
@@ -360,6 +372,7 @@ func (s *Server) handleConn(sc *serverConn) {
 		}
 	}()
 	defer func() {
+		close(sc.writeCh)
 		s.connMu.Lock()
 		delete(s.conns, sc)
 		s.connMu.Unlock()
@@ -427,7 +440,36 @@ func (s *Server) handleConn(sc *serverConn) {
 		}
 
 		s.stats.totalRequests.Add(1)
-		s.processJob(&job{sc: sc, streamID: frame.StreamID, req: kvReq, setReq: setReq, hashReq: hashReq, listReq: listReq})
+		payload := s.processRequest(&job{sc: sc, streamID: frame.StreamID, req: kvReq, setReq: setReq, hashReq: hashReq, listReq: listReq})
+		select {
+		case sc.writeCh <- &responsePayload{streamID: frame.StreamID, payload: payload}:
+		default:
+			s.writeResponseFrame(sc, frame.StreamID, payload)
+		}
+	}
+}
+
+// writeLoop writes encoded responses to the connection. One per connection,
+// providing read-write overlap: handleConn can read the next frame while
+// writeLoop writes the previous response.
+func (s *Server) writeLoop(sc *serverConn) {
+	defer s.wg.Done()
+	for resp := range sc.writeCh {
+		frame := &Frame{
+			StreamID: resp.streamID,
+			Type:     FrameTypeResponse,
+			Payload:  resp.payload,
+		}
+		sc.writeMu.Lock()
+		if s.writeTimeout > 0 {
+			sc.netConn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+		}
+		frame.Encode(sc.netConn)
+		if s.writeTimeout > 0 {
+			sc.netConn.SetWriteDeadline(time.Time{})
+		}
+		sc.writeMu.Unlock()
+		putBuf(resp.payload)
 	}
 }
 
@@ -450,6 +492,34 @@ func (s *Server) worker() {
 	}
 }
 
+// processRequest runs the cache operation and returns the encoded response
+// payload. It does NOT write to the connection — the caller handles that.
+func (s *Server) processRequest(job *job) []byte {
+	switch {
+	case job.hashReq != nil:
+		raw := s.processHash(job.hashReq)
+		payload := getBuf(1 + len(raw))
+		payload[0] = job.hashReq.Cmd
+		copy(payload[1:], raw)
+		return payload
+	case job.listReq != nil:
+		raw := s.processList(job.listReq)
+		payload := getBuf(1 + len(raw))
+		payload[0] = job.listReq.Cmd
+		copy(payload[1:], raw)
+		return payload
+	case job.setReq != nil:
+		raw := s.processSet(job.setReq)
+		payload := getBuf(1 + len(raw))
+		payload[0] = job.setReq.Cmd
+		copy(payload[1:], raw)
+		return payload
+	default:
+		return s.process(job.req).EncodePayload()
+	}
+}
+
+// processJob is kept for the global worker pool (used by Raft path if needed).
 func (s *Server) processJob(job *job) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -457,57 +527,16 @@ func (s *Server) processJob(job *job) {
 				s.errorLog("worker job panic: %v", r)
 			}
 			resp := &Response{Status: StatusErr, ErrMsg: "internal server error"}
-			if job.hashReq != nil {
-				s.writeResponse(job.sc, job.streamID, resp)
-			} else if job.listReq != nil {
-				s.writeResponse(job.sc, job.streamID, resp)
-			} else if job.setReq != nil {
-				s.writeResponse(job.sc, job.streamID, resp)
-			} else {
-				s.writeResponse(job.sc, job.streamID, resp)
-			}
+			s.writeResponse(job.sc, job.streamID, resp)
 		}
 	}()
 
-	var payload []byte
-	switch {
-	case job.hashReq != nil:
-		raw := s.processHash(job.hashReq)
-		payload = getBuf(1 + len(raw))
-		payload[0] = job.hashReq.Cmd
-		copy(payload[1:], raw)
-	case job.listReq != nil:
-		raw := s.processList(job.listReq)
-		payload = getBuf(1 + len(raw))
-		payload[0] = job.listReq.Cmd
-		copy(payload[1:], raw)
-	case job.setReq != nil:
-		raw := s.processSet(job.setReq)
-		payload = getBuf(1 + len(raw))
-		payload[0] = job.setReq.Cmd
-		copy(payload[1:], raw)
-	default:
-		payload = s.process(job.req).EncodePayload()
-	}
-	frame := &Frame{
-		StreamID: job.streamID,
-		Type:     FrameTypeResponse,
-		Payload:  payload,
-	}
-	job.sc.writeMu.Lock()
-	if s.writeTimeout > 0 {
-		job.sc.netConn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
-	}
-	frame.Encode(job.sc.netConn)
-	if s.writeTimeout > 0 {
-		job.sc.netConn.SetWriteDeadline(time.Time{})
-	}
-	job.sc.writeMu.Unlock()
-	putBuf(payload)
+	payload := s.processRequest(job)
+	s.writeResponseFrame(job.sc, job.streamID, payload)
 }
 
-func (s *Server) writeResponse(sc *serverConn, streamID uint32, resp *Response) {
-	payload := resp.EncodePayload()
+// writeResponseFrame writes a pre-encoded payload to the connection.
+func (s *Server) writeResponseFrame(sc *serverConn, streamID uint32, payload []byte) {
 	frame := &Frame{
 		StreamID: streamID,
 		Type:     FrameTypeResponse,
@@ -523,6 +552,10 @@ func (s *Server) writeResponse(sc *serverConn, streamID uint32, resp *Response) 
 	}
 	sc.writeMu.Unlock()
 	putBuf(payload)
+}
+
+func (s *Server) writeResponse(sc *serverConn, streamID uint32, resp *Response) {
+	s.writeResponseFrame(sc, streamID, resp.EncodePayload())
 }
 
 func (s *Server) process(req *Request) *Response {

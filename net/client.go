@@ -105,6 +105,9 @@ func (c *Client) dial(addr string) (*clientConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		tcp.SetNoDelay(true)
+	}
 	return &clientConn{
 		netConn: conn,
 	}, nil
