@@ -263,11 +263,10 @@ func (cc *clientConn) do(req *Request, readTimeout, writeTimeout time.Duration) 
 	}()
 
 	payload := req.EncodePayload()
-	frame := &Frame{
-		StreamID: streamID,
-		Type:     FrameTypeRequest,
-		Payload:  payload,
-	}
+	frame := getFrame()
+	frame.StreamID = streamID
+	frame.Type = FrameTypeRequest
+	frame.Payload = payload
 
 	if writeTimeout > 0 {
 		cc.netConn.SetWriteDeadline(time.Now().Add(writeTimeout))
@@ -276,6 +275,8 @@ func (cc *clientConn) do(req *Request, readTimeout, writeTimeout time.Duration) 
 	err := frame.Encode(cc.netConn)
 	cc.writeMu.Unlock()
 	putBuf(payload)
+	frame.Payload = nil
+	putFrame(frame)
 	if err != nil {
 		cc.markBad()
 		return nil, err
@@ -310,6 +311,7 @@ func (cc *clientConn) readLoop() {
 		}
 
 		if frame.Type != FrameTypeResponse {
+			PutFrame(frame)
 			continue
 		}
 
@@ -324,6 +326,7 @@ func (cc *clientConn) readLoop() {
 				}
 				v, ok := cc.pendingHashMap.Load(frame.StreamID)
 				if !ok {
+					PutFrame(frame)
 					continue
 				}
 				select {
@@ -337,6 +340,7 @@ func (cc *clientConn) readLoop() {
 				}
 				v, ok := cc.pendingListMap.Load(frame.StreamID)
 				if !ok {
+					PutFrame(frame)
 					continue
 				}
 				select {
@@ -350,6 +354,7 @@ func (cc *clientConn) readLoop() {
 				}
 				v, ok := cc.pendingSetMap.Load(frame.StreamID)
 				if !ok {
+					PutFrame(frame)
 					continue
 				}
 				select {
@@ -363,6 +368,7 @@ func (cc *clientConn) readLoop() {
 				}
 				v, ok := cc.pendingMap.Load(frame.StreamID)
 				if !ok {
+					PutFrame(frame)
 					continue
 				}
 				select {
@@ -371,6 +377,7 @@ func (cc *clientConn) readLoop() {
 				}
 			}
 		}
+		PutFrame(frame)
 	}
 }
 
@@ -482,7 +489,10 @@ func (cc *clientConn) doSet(req *SetRequest, readTimeout, writeTimeout time.Dura
 	if payload == nil {
 		return nil, ErrBadResponse
 	}
-	frame := &Frame{StreamID: streamID, Type: FrameTypeRequest, Payload: payload}
+	frame := getFrame()
+	frame.StreamID = streamID
+	frame.Type = FrameTypeRequest
+	frame.Payload = payload
 
 	if writeTimeout > 0 {
 		cc.netConn.SetWriteDeadline(time.Now().Add(writeTimeout))
@@ -491,6 +501,8 @@ func (cc *clientConn) doSet(req *SetRequest, readTimeout, writeTimeout time.Dura
 	err := frame.Encode(cc.netConn)
 	cc.writeMu.Unlock()
 	putBuf(payload)
+	frame.Payload = nil
+	putFrame(frame)
 	if err != nil {
 		cc.markBad()
 		return nil, err

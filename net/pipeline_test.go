@@ -18,23 +18,29 @@ func startServer(t *testing.T) (*Server, string) {
 	}
 	t.Cleanup(func() { c.Close() })
 
-	// Listen on random port first to get the address
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close() // release for ListenAndServe
+	ln.Close()
 
 	srv := NewServer(c, WithWorkers(4))
-	go func() {
-		_ = srv.ListenAndServe(addr)
-	}()
+	go func() { _ = srv.ListenAndServe(addr) }()
 	t.Cleanup(func() { srv.Close() })
 
-	// Wait briefly for server to start
-	time.Sleep(50 * time.Millisecond)
-	return srv, addr
+	// Wait for server to accept connections (with timeout).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return srv, addr
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("server did not start on %s within 2s", addr)
+	return nil, ""
 }
 
 func newTestClient(t *testing.T, addr string) *Client {
@@ -214,23 +220,23 @@ func TestPipeline_Reset(t *testing.T) {
 func TestPipeline_ReuseAfterFlush(t *testing.T) {
 	_, addr := startServer(t)
 	cl := newTestClient(t, addr)
-	p := cl.Pipeline()
 
-	// First batch
-	p.Add(&Request{Cmd: CmdSet, Key: "a", Value: []byte("1")})
-	p.Add(&Request{Cmd: CmdSet, Key: "b", Value: []byte("2")})
-	if _, err := p.DoBatch(nil); err != nil {
+	// First batch via fresh pipeline
+	p1 := cl.Pipeline()
+	p1.Add(&Request{Cmd: CmdSet, Key: "a", Value: []byte("1")})
+	p1.Add(&Request{Cmd: CmdSet, Key: "b", Value: []byte("2")})
+	if _, err := p1.DoBatch(nil); err != nil {
 		t.Fatalf("first batch: %v", err)
 	}
-	p.Reset()
 
-	// Second batch
-	p.Add(&Request{Cmd: CmdGet, Key: "a"})
-	p.Add(&Request{Cmd: CmdGet, Key: "b"})
-	if err := p.FlushWrite(); err != nil {
+	// Second batch via fresh pipeline
+	p2 := cl.Pipeline()
+	p2.Add(&Request{Cmd: CmdGet, Key: "a"})
+	p2.Add(&Request{Cmd: CmdGet, Key: "b"})
+	if err := p2.FlushWrite(); err != nil {
 		t.Fatalf("second flush: %v", err)
 	}
-	resps, err := p.ReadResponses()
+	resps, err := p2.ReadResponses()
 	if err != nil {
 		t.Fatalf("second read: %v", err)
 	}

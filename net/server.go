@@ -16,19 +16,19 @@ import (
 
 // ServerStats holds process-level runtime metrics for the mcache server.
 type ServerStats struct {
-	UptimeMs       int64  `json:"uptime_ms"`
-	Connections    int    `json:"connections"`
-	PeakConns      int    `json:"peak_conns"`
-	TotalRequests  uint64 `json:"total_requests"`
-	BytesRead      uint64 `json:"bytes_read"`
-	BytesWritten   uint64 `json:"bytes_written"`
-	Goroutines     int    `json:"goroutines"`
-	CacheEntries   int    `json:"cache_entries"`
-	CacheMemory    uint64 `json:"cache_memory"`
-	MemoryLimit    uint64 `json:"memory_limit"`
-	GoVersion      string `json:"go_version"`
-	OS             string `json:"os"`
-	Arch           string `json:"arch"`
+	UptimeMs      int64  `json:"uptime_ms"`
+	Connections   int    `json:"connections"`
+	PeakConns     int    `json:"peak_conns"`
+	TotalRequests uint64 `json:"total_requests"`
+	BytesRead     uint64 `json:"bytes_read"`
+	BytesWritten  uint64 `json:"bytes_written"`
+	Goroutines    int    `json:"goroutines"`
+	CacheEntries  int    `json:"cache_entries"`
+	CacheMemory   uint64 `json:"cache_memory"`
+	MemoryLimit   uint64 `json:"memory_limit"`
+	GoVersion     string `json:"go_version"`
+	OS            string `json:"os"`
+	Arch          string `json:"arch"`
 }
 
 // Server serves cache operations over TCP using a multiplexed frame protocol.
@@ -54,11 +54,11 @@ type Server struct {
 
 	// Process-level counters (all atomic).
 	stats struct {
-		startTime      time.Time
-		totalRequests  atomic.Uint64
-		bytesRead      atomic.Uint64
-		bytesWritten   atomic.Uint64
-		peakConns      atomic.Int64
+		startTime     time.Time
+		totalRequests atomic.Uint64
+		bytesRead     atomic.Uint64
+		bytesWritten  atomic.Uint64
+		peakConns     atomic.Int64
 	}
 
 	// Raft integration (optional).
@@ -75,9 +75,9 @@ type job struct {
 	sc       *serverConn
 	streamID uint32
 	req      *Request
-	setReq   *SetRequest   // non-nil for set commands
-	hashReq  *HashRequest  // non-nil for hash commands
-	listReq  *ListRequest  // non-nil for list commands
+	setReq   *SetRequest  // non-nil for set commands
+	hashReq  *HashRequest // non-nil for hash commands
+	listReq  *ListRequest // non-nil for list commands
 }
 
 // responsePayload carries an encoded response ready to write.
@@ -314,8 +314,7 @@ func (s *Server) ListenAndServe(addr string) error {
 			s.infoLog("connection opened remote=%s", conn.RemoteAddr().String())
 		}
 
-		s.wg.Add(2)
-		go s.writeLoop(sc)
+		s.wg.Add(1)
 		go s.handleConn(sc)
 	}
 }
@@ -372,7 +371,6 @@ func (s *Server) handleConn(sc *serverConn) {
 		}
 	}()
 	defer func() {
-		close(sc.writeCh)
 		s.connMu.Lock()
 		delete(s.conns, sc)
 		s.connMu.Unlock()
@@ -396,6 +394,13 @@ func (s *Server) handleConn(sc *serverConn) {
 		}
 
 		if frame.Type != FrameTypeRequest {
+			PutFrame(frame)
+			continue
+		}
+
+		if len(frame.Payload) == 0 {
+			s.writeResponse(sc, frame.StreamID, &Response{Status: StatusErr, ErrMsg: "empty request"})
+			PutFrame(frame)
 			continue
 		}
 
@@ -405,48 +410,49 @@ func (s *Server) handleConn(sc *serverConn) {
 		var hashReq *HashRequest
 		var listReq *ListRequest
 
-		if len(frame.Payload) > 0 {
-			cmd := frame.Payload[0]
-			switch {
-			case IsHashCmd(cmd):
-				hr, err := DecodeHashRequest(frame.Payload)
-				if err != nil {
-					s.writeResponse(sc, frame.StreamID, &Response{Status: StatusErr, ErrMsg: "invalid hash request"})
-					continue
-				}
-				hashReq = hr
-			case IsListCmd(cmd):
-				lr, err := DecodeListRequest(frame.Payload)
-				if err != nil {
-					s.writeResponse(sc, frame.StreamID, &Response{Status: StatusErr, ErrMsg: "invalid list request"})
-					continue
-				}
-				listReq = lr
-			case cmd >= CmdSAdd && cmd <= CmdSDiff:
-				sr, err := DecodeSetRequest(frame.Payload)
-				if err != nil {
-					s.writeResponse(sc, frame.StreamID, &Response{Status: StatusErr, ErrMsg: "invalid set request"})
-					continue
-				}
-				setReq = sr
-			default:
-				req, err := DecodeRequestPayload(frame.Payload)
-				if err != nil {
-					s.writeResponse(sc, frame.StreamID, &Response{Status: StatusErr, ErrMsg: "invalid request"})
-					continue
-				}
-				kvReq = req
+		cmd := frame.Payload[0]
+		switch {
+		case IsHashCmd(cmd):
+			hr, err := DecodeHashRequest(frame.Payload)
+			if err != nil {
+				s.writeResponse(sc, frame.StreamID, &Response{Status: StatusErr, ErrMsg: "invalid hash request"})
+				PutFrame(frame)
+				continue
 			}
+			hashReq = hr
+		case IsListCmd(cmd):
+			lr, err := DecodeListRequest(frame.Payload)
+			if err != nil {
+				s.writeResponse(sc, frame.StreamID, &Response{Status: StatusErr, ErrMsg: "invalid list request"})
+				PutFrame(frame)
+				continue
+			}
+			listReq = lr
+		case cmd >= CmdSAdd && cmd <= CmdSDiff:
+			sr, err := DecodeSetRequest(frame.Payload)
+			if err != nil {
+				s.writeResponse(sc, frame.StreamID, &Response{Status: StatusErr, ErrMsg: "invalid set request"})
+				PutFrame(frame)
+				continue
+			}
+			setReq = sr
+		default:
+			req, err := DecodeRequestPayload(frame.Payload)
+			if err != nil {
+				s.writeResponse(sc, frame.StreamID, &Response{Status: StatusErr, ErrMsg: "invalid request"})
+				PutFrame(frame)
+				continue
+			}
+			kvReq = req
 		}
 
-		s.stats.totalRequests.Add(1)
-		payload := s.processRequest(&job{sc: sc, streamID: frame.StreamID, req: kvReq, setReq: setReq, hashReq: hashReq, listReq: listReq})
-		select {
-		case sc.writeCh <- &responsePayload{streamID: frame.StreamID, payload: payload}:
-		default:
-			s.writeResponseFrame(sc, frame.StreamID, payload)
-		}
-	}
+	sid := frame.StreamID
+	PutFrame(frame)
+
+	s.stats.totalRequests.Add(1)
+	payload := s.processRequest(&job{sc: sc, streamID: sid, req: kvReq, setReq: setReq, hashReq: hashReq, listReq: listReq})
+	s.writeResponseFrame(sc, sid, payload)
+}
 }
 
 // writeLoop writes encoded responses to the connection. One per connection,
@@ -455,11 +461,10 @@ func (s *Server) handleConn(sc *serverConn) {
 func (s *Server) writeLoop(sc *serverConn) {
 	defer s.wg.Done()
 	for resp := range sc.writeCh {
-		frame := &Frame{
-			StreamID: resp.streamID,
-			Type:     FrameTypeResponse,
-			Payload:  resp.payload,
-		}
+		frame := getFrame()
+		frame.StreamID = resp.streamID
+		frame.Type = FrameTypeResponse
+		frame.Payload = resp.payload
 		sc.writeMu.Lock()
 		if s.writeTimeout > 0 {
 			sc.netConn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
@@ -470,6 +475,8 @@ func (s *Server) writeLoop(sc *serverConn) {
 		}
 		sc.writeMu.Unlock()
 		putBuf(resp.payload)
+		frame.Payload = nil
+		putFrame(frame)
 	}
 }
 
@@ -537,11 +544,10 @@ func (s *Server) processJob(job *job) {
 
 // writeResponseFrame writes a pre-encoded payload to the connection.
 func (s *Server) writeResponseFrame(sc *serverConn, streamID uint32, payload []byte) {
-	frame := &Frame{
-		StreamID: streamID,
-		Type:     FrameTypeResponse,
-		Payload:  payload,
-	}
+	frame := getFrame()
+	frame.StreamID = streamID
+	frame.Type = FrameTypeResponse
+	frame.Payload = payload
 	sc.writeMu.Lock()
 	if s.writeTimeout > 0 {
 		sc.netConn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
@@ -552,6 +558,8 @@ func (s *Server) writeResponseFrame(sc *serverConn, streamID uint32, payload []b
 	}
 	sc.writeMu.Unlock()
 	putBuf(payload)
+	frame.Payload = nil
+	putFrame(frame)
 }
 
 func (s *Server) writeResponse(sc *serverConn, streamID uint32, resp *Response) {

@@ -63,11 +63,10 @@ func (p *Pipeline) Add(req *Request) error {
 	p.conn.pendingMap.Store(streamID, respCh)
 
 	payload := req.EncodePayload()
-	frame := &Frame{
-		StreamID: streamID,
-		Type:     FrameTypeRequest,
-		Payload:  payload,
-	}
+	frame := getFrame()
+	frame.StreamID = streamID
+	frame.Type = FrameTypeRequest
+	frame.Payload = payload
 
 	p.frames = append(p.frames, frame)
 	p.payloads = append(p.payloads, payload)
@@ -110,6 +109,10 @@ func (p *Pipeline) FlushWrite() error {
 	}
 	p.conn.writeMu.Unlock()
 
+	for _, frame := range p.frames {
+		frame.Payload = nil
+		putFrame(frame)
+	}
 	for _, payload := range p.payloads {
 		putBuf(payload)
 	}
@@ -197,6 +200,13 @@ func (p *Pipeline) Reset() {
 }
 
 func (p *Pipeline) cleanup(_ error) {
+	for _, frame := range p.frames {
+		if frame.Payload != nil {
+			putBuf(frame.Payload)
+		}
+		frame.Payload = nil
+		putFrame(frame)
+	}
 	for i, id := range p.ids {
 		p.conn.pendingMap.Delete(id)
 		select {
