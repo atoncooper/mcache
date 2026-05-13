@@ -42,6 +42,8 @@ func main() {
 	redisAddr := flag.String("redis", "127.0.0.1:6379", "Redis address")
 	mode := flag.String("mode", "set", "benchmark mode: set, get, mix")
 	profile := flag.String("profile", "small", "size profile")
+	keySize := flag.Int("key-size", 0, "key size override (0=use profile)")
+	valSize := flag.Int("val-size", 0, "value size override (0=use profile)")
 	totalOps := flag.Int("ops", 100_000, "total operations")
 	goroutines := flag.Int("goroutines", 64, "concurrent goroutines")
 	pipelineSize := flag.Int("pipeline", 0, "pipeline batch size (0=off)")
@@ -49,13 +51,27 @@ func main() {
 	overhead := flag.Bool("overhead", false, "measure per-key memory overhead")
 	flag.Parse()
 
+	ks, vs := *keySize, *valSize
+	if ks == 0 || vs == 0 {
+		sp, ok := sizeProfiles[*profile]
+		if !ok {
+			sp = sizeProfiles["small"]
+		}
+		if ks == 0 {
+			ks = sp.keySize
+		}
+		if vs == 0 {
+			vs = sp.valSize
+		}
+	}
+
 	if *sweep {
 		runSweep(*mcacheAddr, *redisAddr)
 		return
 	}
 
 	if *overhead {
-		runOverhead(*mcacheAddr, *redisAddr, *profile)
+		runOverhead(*mcacheAddr, *redisAddr, ks, vs)
 		return
 	}
 
@@ -64,8 +80,8 @@ func main() {
 		mcacheAddr:   *mcacheAddr,
 		redisAddr:    *redisAddr,
 		mode:         *mode,
-		keySize:      sizeProfiles[*profile].keySize,
-		valSize:      sizeProfiles[*profile].valSize,
+		keySize:      ks,
+		valSize:      vs,
 		totalOps:     *totalOps,
 		goroutines:   *goroutines,
 		pipelineSize: *pipelineSize,
@@ -95,14 +111,14 @@ func runSweep(mcacheAddr, redisAddr string) {
 
 	for _, mode := range modes {
 		for _, prof := range profiles {
-			p := sizeProfiles[prof]
+			sp := sizeProfiles[prof]
 			for _, g := range gCounts {
 				cfg := benchConfig{
 					mcacheAddr:   mcacheAddr,
 					redisAddr:    redisAddr,
 					mode:         mode,
-					keySize:      p.keySize,
-					valSize:      p.valSize,
+					keySize:      sp.keySize,
+					valSize:      sp.valSize,
 					totalOps:     max(50000, g*1000),
 					goroutines:   g,
 					pipelineSize: 0,
@@ -154,20 +170,19 @@ func runSweep(mcacheAddr, redisAddr string) {
 // Overhead mode — measure per-key memory cost
 // ---------------------------------------------------------------------------
 
-func runOverhead(mcacheAddr, redisAddr, profile string) {
-	p := sizeProfiles[profile]
+func runOverhead(mcacheAddr, redisAddr string, keySize, valSize int) {
 	nKeys := 50000
-	val := fillBytes(make([]byte, p.valSize))
+	val := fillBytes(make([]byte, valSize))
 
 	// Measure mcache memory
 	fmt.Println(strings.Repeat("=", 90))
-	fmt.Printf("  Memory Overhead — %dB key + %dB val, %d keys\n", p.keySize, p.valSize, nKeys)
+	fmt.Printf("  Memory Overhead — %dB key + %dB val, %d keys\n", keySize, valSize, nKeys)
 	fmt.Println(strings.Repeat("=", 90))
 
 	mBefore := getRSS(mcacheAddr) // best-effort via stats
 	mc, _ := sdk.NewClient(mcacheAddr, sdk.WithPoolSize(4), sdk.WithCodec(sdk.RawCodec{}))
 	for i := 0; i < nKeys; i++ {
-		mc.Set(genKey(nil, i, p.keySize), val, 0)
+		mc.Set(genKey(nil, i, keySize), val, 0)
 	}
 	mc.Close()
 	time.Sleep(500 * time.Millisecond) // let GC settle
@@ -182,7 +197,7 @@ func runOverhead(mcacheAddr, redisAddr, profile string) {
 	ctx := context.Background()
 	pipe := rdb.Pipeline()
 	for i := nKeys; i < nKeys*2; i++ {
-		pipe.Set(ctx, genKey(nil, i, p.keySize), val, 0)
+		pipe.Set(ctx, genKey(nil, i, keySize), val, 0)
 	}
 	pipe.Exec(ctx)
 	time.Sleep(500 * time.Millisecond)
@@ -203,8 +218,8 @@ func runOverhead(mcacheAddr, redisAddr, profile string) {
 	fmt.Printf("  %-20s │ %12d B │ %12d B\n", "total memory", mMem, rMem)
 	fmt.Printf("  %-20s │ %14d │ %14d\n", "entries", mEntries, nKeys)
 	fmt.Printf("  %-20s │ %12.0f B │ %12.0f B\n", "per-key overhead", mPerKey, rPerKey)
-	fmt.Printf("  %-20s │ %12.0f B │ %12.0f B\n", "theoretical (key+val)", float64(p.keySize+p.valSize), float64(p.keySize+p.valSize))
-	fmt.Printf("  %-20s │ %12.0f B │ %12.0f B\n", "extra overhead", mPerKey-float64(p.keySize+p.valSize), rPerKey-float64(p.keySize+p.valSize))
+	fmt.Printf("  %-20s │ %12.0f B │ %12.0f B\n", "theoretical (key+val)", float64(keySize+valSize), float64(keySize+valSize))
+	fmt.Printf("  %-20s │ %12.0f B │ %12.0f B\n", "extra overhead", mPerKey-float64(keySize+valSize), rPerKey-float64(keySize+valSize))
 	fmt.Println(strings.Repeat("=", 90))
 	_ = mBefore
 }

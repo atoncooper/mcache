@@ -31,15 +31,17 @@ func main() {
 	mcacheAddr := flag.String("mcache", "127.0.0.1:11211", "mcache address")
 	redisAddr := flag.String("redis", "127.0.0.1:6379", "Redis address")
 	testName := flag.String("test", "scale", "test: scale, oscillate, recovery")
+	keySize := flag.Int("key-size", 64, "key size in bytes")
+	valSize := flag.Int("val-size", 1024, "value size in bytes (use 524288 for 512KB)")
 	flag.Parse()
 
 	switch *testName {
 	case "oscillate":
-		runOscillate(*mcacheAddr, *redisAddr)
+		runOscillate(*mcacheAddr, *redisAddr, *keySize, *valSize)
 	case "recovery":
-		runRecovery(*mcacheAddr)
+		runRecovery(*mcacheAddr, *keySize, *valSize)
 	default:
-		runScale(*mcacheAddr, *redisAddr)
+		runScale(*mcacheAddr, *redisAddr, *keySize, *valSize)
 	}
 }
 
@@ -50,8 +52,7 @@ func main() {
 // Redis has fixed capacity — once full, entries plateau.
 // ---------------------------------------------------------------------------
 
-func runScale(mcacheAddr, redisAddr string) {
-	keySize, valSize := 64, 1024 // ~1KB per entry
+func runScale(mcacheAddr, redisAddr string, keySize, valSize int) {
 
 	fmt.Println(strings.Repeat("=", 100))
 	fmt.Println("  MBR Adaptive Shard Scaling Test")
@@ -155,8 +156,7 @@ func runScale(mcacheAddr, redisAddr string) {
 // oscillates (migrate ↔ evict repeatedly) or stabilizes.
 // ---------------------------------------------------------------------------
 
-func runOscillate(mcacheAddr, redisAddr string) {
-	keySize, valSize := 64, 256
+func runOscillate(mcacheAddr, redisAddr string, keySize, valSize int) {
 	fmt.Println(strings.Repeat("=", 100))
 	fmt.Println("  MBR Oscillation Resistance Test")
 	fmt.Println("  Alternates high/low pressure to test PID stability")
@@ -253,8 +253,7 @@ func runOscillate(mcacheAddr, redisAddr string) {
 // measures how long until throughput recovers to pre-migration levels.
 // ---------------------------------------------------------------------------
 
-func runRecovery(mcacheAddr string) {
-	keySize, valSize := 64, 256
+func runRecovery(mcacheAddr string, keySize, valSize int) {
 	fmt.Println(strings.Repeat("=", 90))
 	fmt.Println("  MBR Recovery Time Test")
 	fmt.Println("  Measures: how long after migration until throughput stabilizes")
