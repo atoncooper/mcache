@@ -62,7 +62,7 @@ On Windows, use Docker or Start-Process to background the server.`,
 		}
 
 		// Wire infra observer if enabled - logs cache hit/miss/set/del/evict/rehash.
-		var infraObs *infra.Infra
+		var infraObs mcache.CacheObserver
 		if cfg.Cache.ObserverEnabled {
 			infraOpts := []infra.Option{infra.WithLoggerInstance(logger)}
 
@@ -70,17 +70,18 @@ On Windows, use Docker or Start-Process to background the server.`,
 				infraOpts = append(infraOpts, infra.WithPrometheus(true))
 			}
 
-			infraObs = infra.New(infraOpts...)
+			infra := infra.New(infraOpts...)
+			infraObs = infra
 			opts = opts.WithObserver(infraObs)
 
-			if cfg.Server.Metrics.Enabled && infraObs != nil {
-				if err := infraObs.RegisterPrometheus(prometheus.DefaultRegisterer); err != nil {
+			if cfg.Server.Metrics.Enabled && infra != nil {
+				if err := infra.RegisterPrometheus(prometheus.DefaultRegisterer); err != nil {
 					logger.Error("prometheus register", map[string]any{"error": err.Error()})
 				}
 			}
 
 			logger.Debug("observer wired", map[string]any{
-				"observer_enabled":  true,
+				"observer_enabled":   true,
 				"prometheus_enabled": cfg.Server.Metrics.Enabled,
 			})
 		}
@@ -158,7 +159,7 @@ On Windows, use Docker or Start-Process to background the server.`,
 
 		// Start MBR decision engine if enabled.
 		if cfg.MBR.Enabled {
-			startMBR(c, cfg, logger)
+			startMBR(c, cfg, logger, infraObs)
 		}
 
 		sigCh := make(chan os.Signal, 1)
@@ -175,10 +176,6 @@ On Windows, use Docker or Start-Process to background the server.`,
 			}
 		}
 
-		if infraObs != nil {
-			infraObs.Stop()
-		}
-
 		if err := srv.Close(); err != nil {
 			logger.Error("server close", map[string]any{"error": err.Error()})
 		}
@@ -193,13 +190,15 @@ func init() {
 }
 
 // startMBR initialises and starts the MBR decision engine.
-func startMBR(c *mcache.Cache, cfg *mcache.Config, logger infra.Logger) {
+func startMBR(c *mcache.Cache, cfg *mcache.Config, logger infra.Logger, infraObserver mcache.CacheObserver) {
 	interval, _ := time.ParseDuration(cfg.MBR.DecisionInterval)
 	if interval == 0 {
 		interval = 500 * time.Millisecond
 	}
 
-	// Build MBR options
+	// Build migration config from YAML (was previously ignored).
+	migCfg := buildMigratorConfig(cfg.MBR.Migration)
+
 	mbrOpts := mbr.NewOptions().
 		WithMatrixCapacity(cfg.MBR.MatrixCapacity).
 		WithDecisionInterval(interval).
@@ -218,12 +217,17 @@ func startMBR(c *mcache.Cache, cfg *mcache.Config, logger infra.Logger) {
 			EvictionPressure: cfg.MBR.Weights.EvictionPressure,
 			BufferPenalty:    cfg.MBR.Weights.BufferPenalty,
 		}).
-		WithMigration(mbr.DefaultMigratorConfig())
+		WithMigration(migCfg)
 
-	// Start system monitor
+	// Start system monitor. Align interval with decision interval so that
+	// every decision window has fresh memory / CPU data rather than 1 in 10.
+	monInterval := interval
+	if monInterval < 500*time.Millisecond {
+		monInterval = 500 * time.Millisecond
+	}
 	mon := monitor.New(monitor.NewOptions().
-		WithInterval(5 * time.Second).
-		WithCapacity(60).
+		WithInterval(monInterval).
+		WithCapacity(cfg.MBR.MatrixCapacity).
 		WithCollectors(monitor.NewRuntime()),
 	)
 	mon.Start()
@@ -237,8 +241,12 @@ func startMBR(c *mcache.Cache, cfg *mcache.Config, logger infra.Logger) {
 	// Create feature provider
 	provider := mbr.NewDefaultStatsProvider(c, mon, pid)
 
-	// Inject provider observer into cache (compose with existing observer if needed)
-	c.SetObserver(provider.Observer())
+	// Compose observers: fan out to both infra (metrics/logging) and MBR
+	// (decision-engine counters). This replaces the previous SetObserver
+	// call that silently dropped the infra observer.
+	mbrObserver := provider.Observer()
+	composite := mcache.NewMultiObserver(infraObserver, mbrObserver)
+	c.SetObserver(composite)
 
 	// Decision channel
 	decisionCh := make(chan mbr.DecisionEvent, 16)
@@ -252,17 +260,53 @@ func startMBR(c *mcache.Cache, cfg *mcache.Config, logger infra.Logger) {
 		mbr.WithMatrixCapacity(mbrOpts.MatrixCapacity),
 		mbr.WithPID(mbrOpts.PID),
 		mbr.WithWeights(mbrOpts.Weights),
-		mbr.WithMigratorConfig(mbrOpts.Migration),
+		mbr.WithMigratorConfig(migCfg),
 	)
 
-	// Start migration executor
-	go mbr.RunMigrationExecutor(ctx, decisionCh, c, mon, provider, mbrOpts.Migration)
+	// Start migration executor (provider is wired inside for MigrationActive tracking)
+	go mbr.RunMigrationExecutor(ctx, decisionCh, c, mon, provider, migCfg)
 
 	logger.Info("MBR decision engine started", map[string]any{
-		"matrix_capacity": mbrOpts.MatrixCapacity,
-		"interval":        mbrOpts.DecisionInterval.String(),
-		"setpoint":        mbrOpts.PID.Setpoint,
+		"matrix_capacity":      mbrOpts.MatrixCapacity,
+		"interval":             mbrOpts.DecisionInterval.String(),
+		"monitor_interval":     monInterval.String(),
+		"setpoint":             mbrOpts.PID.Setpoint,
+		"target_load_per_shard": migCfg.TargetLoadPerShard,
+		"min_shards":           migCfg.MinShards,
+		"max_shards":           migCfg.MaxShards,
 	})
+}
+
+// buildMigratorConfig converts the YAML migration block to an mbr.MigratorConfig.
+func buildMigratorConfig(m mcache.MBRMigrationConfig) mbr.MigratorConfig {
+	cfg := mbr.DefaultMigratorConfig()
+
+	if m.CheckInterval != "" {
+		if d, err := time.ParseDuration(m.CheckInterval); err == nil {
+			cfg.CheckInterval = d
+		}
+	}
+	if m.MaxMigrationTime != "" {
+		if d, err := time.ParseDuration(m.MaxMigrationTime); err == nil {
+			cfg.MaxMigrationTime = d
+		}
+	}
+	if m.PauseOnCPUThreshold > 0 {
+		cfg.PauseOnCPUThreshold = m.PauseOnCPUThreshold
+	}
+	if m.PauseOnMemThreshold > 0 {
+		cfg.PauseOnMemThreshold = m.PauseOnMemThreshold
+	}
+	if m.TargetLoadPerShard > 0 {
+		cfg.TargetLoadPerShard = m.TargetLoadPerShard
+	}
+	if m.MinShards > 0 {
+		cfg.MinShards = m.MinShards
+	}
+	if m.MaxShards > 0 {
+		cfg.MaxShards = m.MaxShards
+	}
+	return cfg
 }
 
 // parseMemoryLimit converts a human-readable string like "500MB" or "1.5GB" to bytes.
