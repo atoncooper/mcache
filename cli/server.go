@@ -55,6 +55,12 @@ On Windows, use Docker or Start-Process to background the server.`,
 			os.Exit(1)
 		}
 
+		// When MBR is enabled, start with its min_shards so the decision
+		// engine has room to grow shards under pressure.
+		if cfg.MBR.Enabled && cfg.MBR.Migration.MinShards > 0 {
+			opts = opts.WithShards(cfg.MBR.Migration.MinShards)
+		}
+
 		// Wire infra observer if enabled - logs cache hit/miss/set/del/evict/rehash.
 		var infraObs *infra.Infra
 		if cfg.Cache.ObserverEnabled {
