@@ -114,7 +114,7 @@ func RunMigrationExecutor(
 	provider *DefaultStatsProvider,
 	cfg MigratorConfig,
 ) {
-	executor := NewMigrationExecutor(cache, mon, cfg)
+	executor := NewMigrationExecutor(cache, mon, cfg, provider)
 
 	for {
 		select {

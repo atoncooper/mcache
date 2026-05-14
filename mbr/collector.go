@@ -19,9 +19,9 @@ type StatsProvider interface {
 //   - an internal CacheObserver (hit rate, eviction rate, evicted-idle tracking)
 //   - a PIDController for setpoint deviation
 type DefaultStatsProvider struct {
-	cache   *mcache.Cache
-	mon     *monitor.Monitor
-	pid     *PIDController
+	cache *mcache.Cache
+	mon   *monitor.Monitor
+	pid   *PIDController
 
 	// Observer-driven counters (updated from cache callbacks)
 	hits      atomic.Int64
@@ -31,12 +31,25 @@ type DefaultStatsProvider struct {
 	evictIdle atomic.Int64 // cumulative idle nanos of evicted keys
 	evictCnt  atomic.Uint64
 
+	// Migration-active flag (set by executor, read by GetLatestStats).
+	migrationActive atomic.Bool
+
 	// Previous-state tracking for rate calculations
-	prevKeys    int64
-	prevHit     int64
-	prevMiss    int64
-	prevEvict   int64
-	prevMem     float64
+	prevKeys  int64
+	prevHit   int64
+	prevMiss  int64
+	prevEvict int64
+	prevSets  uint64
+
+	// Smoothed memory-growth tracking.
+	// MemGrowthRate is carried forward between monitor updates so the
+	// scorecard sees a consistent signal instead of getting a non-zero
+	// value only on the single tick that coincides with a monitor refresh.
+	smoothedMemGrowth  float64
+	lastMemRatio       float64
+	lastMemUpdateTime  time.Time
+	memRatioInitialized bool
+
 	lastCollect time.Time
 }
 
@@ -56,9 +69,21 @@ func NewDefaultStatsProvider(c *mcache.Cache, mon *monitor.Monitor, pid *PIDCont
 // Observer returns a cache.Observer-compatible handle for tracking
 // hit / miss / eviction events. The caller should inject this into
 // the Cache via WithObserver. If another observer (e.g. infra.Infra)
-// is already in use, compose them with a fan-out observer.
+// is already in use, compose them with a MultiObserver.
 func (p *DefaultStatsProvider) Observer() mcache.CacheObserver {
 	return &providerObserver{p: p}
+}
+
+// SetMigrationActive is called by the migration executor to inform the
+// provider that a migration is in progress, so the scorecard can apply
+// migration suppression.
+func (p *DefaultStatsProvider) SetMigrationActive(active bool) {
+	p.migrationActive.Store(active)
+}
+
+// IsMigrationActive reports whether a migration is currently running.
+func (p *DefaultStatsProvider) IsMigrationActive() bool {
+	return p.migrationActive.Load()
 }
 
 // GetLatestStats gathers all features into a WindowStats snapshot and
@@ -110,15 +135,17 @@ func (p *DefaultStatsProvider) GetLatestStats() WindowStats {
 
 	// --- Access pattern ---
 	s := p.sets.Load()
+	sDelta := s - p.prevSets
+	p.prevSets = s
 	if totalDelta > 0 {
-		stats.NewKeysRate = float64(s) / float64(totalDelta)
-	} else if s > 0 {
+		stats.NewKeysRate = float64(sDelta) / float64(totalDelta)
+	} else if sDelta > 0 {
 		stats.NewKeysRate = 1.0
 	}
 	if s > 0 {
-		reads := totalDelta - int64(s)
+		reads := totalDelta - int64(sDelta)
 		if reads > 0 {
-			stats.ReadWriteRatio = float64(reads) / float64(s)
+			stats.ReadWriteRatio = float64(reads) / float64(sDelta)
 		}
 	}
 
@@ -129,12 +156,26 @@ func (p *DefaultStatsProvider) GetLatestStats() WindowStats {
 			stats.CPUUtil = snap.CPU.UsagePercent / 100
 		}
 		if snap.Memory != nil {
-			stats.MemUsageRatio = snap.Memory.UsedPercent / 100
-			memDelta := stats.MemUsageRatio - p.prevMem
-			if memDelta > 0 {
-				stats.MemGrowthRate = memDelta / dt
+			newRatio := snap.Memory.UsedPercent / 100
+			stats.MemUsageRatio = newRatio
+
+			// Compute and carry forward memory growth rate.
+			// When the monitor has not yet refreshed, persist the last known
+			// rate so the scorecard sees a stable signal across consecutive
+			// decision windows.
+			if p.memRatioInitialized {
+				elapsed := now.Sub(p.lastMemUpdateTime).Seconds()
+				if newRatio != p.lastMemRatio && elapsed > 0 {
+					p.smoothedMemGrowth = (newRatio - p.lastMemRatio) / elapsed
+					p.lastMemRatio = newRatio
+					p.lastMemUpdateTime = now
+				}
+			} else {
+				p.lastMemRatio = newRatio
+				p.lastMemUpdateTime = now
+				p.memRatioInitialized = true
 			}
-			p.prevMem = stats.MemUsageRatio
+			stats.MemGrowthRate = p.smoothedMemGrowth
 		}
 		// Disk I/O pressure: aggregate transfer rate relative to 100 MB/s
 		var totalR, totalW float64
@@ -154,6 +195,7 @@ func (p *DefaultStatsProvider) GetLatestStats() WindowStats {
 
 	// --- Migration state ---
 	stats.RehashActive = p.cache.IsRehashing()
+	stats.MigrationActive = p.migrationActive.Load()
 
 	// --- Buffer pressure (defaults to 0; fill from real metrics when available) ---
 
@@ -187,7 +229,6 @@ func (o *providerObserver) OnDel(key string)  {} // not used by scorecard
 func (o *providerObserver) OnEvict(key string) {
 	o.p.evictions.Add(1)
 	o.p.evictCnt.Add(1)
-	// We don't have idle-time tracking from the shard; default to 0.
 }
 func (o *providerObserver) OnRehashStart(oldShards, newShards int) {}
 func (o *providerObserver) OnRehashDone()                           {}

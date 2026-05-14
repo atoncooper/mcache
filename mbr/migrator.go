@@ -38,20 +38,23 @@ func DefaultMigratorConfig() MigratorConfig {
 // IncrementalMigrationExecutor drives an incremental rehash and adapts to
 // system pressure, pausing when the system is overloaded.
 type IncrementalMigrationExecutor struct {
-	cache   *mcache.Cache
-	mon     *monitor.Monitor
-	cfg     MigratorConfig
-	mu      sync.Mutex
-	paused  atomic.Bool
+	cache    *mcache.Cache
+	mon      *monitor.Monitor
+	cfg      MigratorConfig
+	provider *DefaultStatsProvider // optional; for MigrationActive tracking
+	mu       sync.Mutex
+	paused   atomic.Bool
 	progress atomic.Value // *MigrationProgress
 }
 
 // NewMigrationExecutor creates an executor wired to the given cache and monitor.
-func NewMigrationExecutor(c *mcache.Cache, mon *monitor.Monitor, cfg MigratorConfig) *IncrementalMigrationExecutor {
+// If provider is non-nil, the executor will set MigrationActive on it.
+func NewMigrationExecutor(c *mcache.Cache, mon *monitor.Monitor, cfg MigratorConfig, provider *DefaultStatsProvider) *IncrementalMigrationExecutor {
 	e := &IncrementalMigrationExecutor{
-		cache: c,
-		mon:   mon,
-		cfg:   cfg,
+		cache:    c,
+		mon:      mon,
+		cfg:      cfg,
+		provider: provider,
 	}
 	e.progress.Store(&MigrationProgress{State: MigrationIdle})
 	return e
@@ -111,6 +114,13 @@ func (e *IncrementalMigrationExecutor) Execute(ctx context.Context) error {
 		return err
 	}
 
+	// Signal MigrationActive to the provider so the scorecard applies
+	// suppression during the migration.
+	if e.provider != nil {
+		e.provider.SetMigrationActive(true)
+		defer e.provider.SetMigrationActive(false)
+	}
+
 	e.updateProgress(MigrationRunning, "")
 	e.mu.Unlock()
 
@@ -137,7 +147,6 @@ func (e *IncrementalMigrationExecutor) Execute(ctx context.Context) error {
 
 			// Force-complete if exceeding max time
 			if time.Since(start) > e.cfg.MaxMigrationTime {
-				// Let the ongoing rehash finish naturally; force by draining.
 				e.forceComplete()
 			}
 
@@ -189,11 +198,14 @@ func (e *IncrementalMigrationExecutor) waitResume(ctx context.Context) {
 }
 
 // forceComplete accelerates rehash completion by calling Get on a dummy key
-// repeatedly to trigger incremental Step calls.
+// repeatedly to trigger incremental Step calls. A small sleep between
+// iterations prevents CPU spin.
 func (e *IncrementalMigrationExecutor) forceComplete() {
 	for e.cache.IsRehashing() {
-		// Each call triggers rehash.Step() internally.
 		_, _ = e.cache.Get("__mbr_force_complete__")
+		// Small backoff to avoid burning CPU; each Get already triggers
+		// a rehash step, so 1ms is enough backpressure.
+		time.Sleep(time.Millisecond)
 	}
 	e.progress.Store(&MigrationProgress{State: MigrationCompleted})
 }
@@ -205,15 +217,11 @@ func (e *IncrementalMigrationExecutor) forceComplete() {
 func (e *IncrementalMigrationExecutor) calculateTargetShards(currentKeys int) int {
 	effectiveLoad := e.cfg.TargetLoadPerShard
 
-	// Reduce effective target load when memory is under pressure so that
-	// large values don't get stuck: 512KB × 1248 keys can saturate memory
-	// while the count-based formula thinks only 4 shards are needed.
 	if e.mon != nil {
 		if snap, ok := e.mon.Latest(); ok && snap.Memory != nil {
 			memRatio := snap.Memory.UsedPercent / 100
 			const setpoint = 0.60
 			if memRatio > setpoint {
-				// Scale factor from 0 (at setpoint) to 1 (at 100%).
 				pressure := (memRatio - setpoint) / (1.0 - setpoint)
 				adjusted := int(float64(effectiveLoad) * (1.0 - pressure*0.75))
 				if adjusted < 64 {
@@ -242,6 +250,5 @@ func nextPowerOfTwo(n int) int {
 	if n <= 1 {
 		return 1
 	}
-	// Round up to next power of two.
 	return 1 << (bits.Len(uint(n - 1)))
 }

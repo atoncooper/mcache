@@ -135,10 +135,10 @@ func TestMemGrowthScore(t *testing.T) {
 	if s := memGrowthScore(0.0); s != 0 {
 		t.Errorf("zero growth should be 0, got %f", s)
 	}
-	if s := memGrowthScore(0.15); s <= 0 || s >= 1 {
+	if s := memGrowthScore(0.03); s <= 0 || s >= 1 {
 		t.Errorf("mid growth should be in (0,1), got %f", s)
 	}
-	if s := memGrowthScore(0.3); s != 1 {
+	if s := memGrowthScore(0.05); s != 1 {
 		t.Errorf("high growth should be 1, got %f", s)
 	}
 }
@@ -313,7 +313,7 @@ func TestDecide_BufferPenalty(t *testing.T) {
 }
 
 func TestDecide_ConsecutiveWindow(t *testing.T) {
-	// Only 1 window in matrix — no consecutive confirmation
+	// Single strong window (>0.65) — triggers migration without full history.
 	matrix := NewFeatureMatrix(10)
 	matrix.Push(WindowStats{
 		MemUsageRatio:   0.9,
@@ -331,9 +331,20 @@ func TestDecide_ConsecutiveWindow(t *testing.T) {
 		EvictionsPerSec: 150,
 	}
 	d, _ := Decide(stats, matrix, DefaultWeights())
-	// With only 1 window, need 3 consecutive, so should be EVICT
-	if d != DecisionEvict {
-		t.Errorf("expected EVICT without 3 consecutive windows, got %s", d)
+	if d != DecisionMigrate {
+		t.Errorf("expected MIGRATE with single strong window, got %s", d)
+	}
+
+	// Weak window (score ≤0.65) — should stay EVICT.
+	weakStats := WindowStats{
+		MemUsageRatio: 0.1,
+		HitRate:       1.0,
+		NewKeysRate:   0.0,
+	}
+	matrix2 := NewFeatureMatrix(10)
+	d2, _ := Decide(weakStats, matrix2, DefaultWeights())
+	if d2 != DecisionEvict {
+		t.Errorf("expected EVICT with weak window, got %s", d2)
 	}
 }
 

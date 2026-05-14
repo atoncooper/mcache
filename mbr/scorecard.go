@@ -22,21 +22,41 @@ func DefaultWeights() ScoreWeights {
 	}
 }
 
+const (
+	// migrateThreshold is the minimum score to consider a migration decision.
+	migrateThreshold = 0.55
+	// consecutiveWindows is the number of recent windows that must all exceed
+	// the threshold before a migration is triggered (prevents flapping).
+	consecutiveWindows = 2
+	// falsePressureFactor dampens the score when buffer pressure is the
+	// dominant cause of high memory usage rather than genuine hot-data growth.
+	falsePressureFactor = 0.6
+	// migrationSuppressionFactor strongly dampens the score while a migration
+	// or rehash is already in progress.
+	migrationSuppressionFactor = 0.3
+)
+
 // Decide runs the weighted scorecard against the current stats and recent
 // history. It returns the decision and the final computed score.
 func Decide(stats WindowStats, matrix *FeatureMatrix, weights ScoreWeights) (Decision, float64) {
 	// --- Step 1: per-factor scores ---
 	memScore := memGrowthScore(stats.MemGrowthRate)
 	hitScore := hitRateScore(stats.HitRate)
-	nkScore  := newKeysScore(stats.NewKeysRate)
-	evScore  := evictionPressureScore(stats.EvictionsPerSec)
-	bufPen   := bufferPenalty(stats)
+	nkScore := newKeysScore(stats.NewKeysRate)
+	evScore := evictionPressureScore(stats.EvictionsPerSec)
+	keyScore := keysGrowthScore(stats.KeysGrowthRate)
+	bufPen := bufferPenalty(stats)
 
 	// --- Step 2: false-pressure suppression ---
 	falsePressure := isFalsePressure(stats)
 
 	// --- Step 3: weighted raw score ---
-	raw := weights.MemGrowth*memScore +
+	// Blend memGrowth and keysGrowth: use the stronger signal as the primary
+	// growth indicator so that write-heavy workloads (high KeysGrowthRate)
+	// can trigger migration even when the system memory monitor updates slowly.
+	growthScore := math.Max(memScore, keyScore*0.8)
+
+	raw := weights.MemGrowth*growthScore +
 		weights.HitRate*hitScore +
 		weights.NewKeys*nkScore +
 		weights.EvictionPressure*evScore +
@@ -47,22 +67,34 @@ func Decide(stats WindowStats, matrix *FeatureMatrix, weights ScoreWeights) (Dec
 
 	// --- Step 3b: false-pressure suppression ---
 	if falsePressure {
-		raw *= 0.4 // strong dampening: buffer pressure ≠ hot-data growth
+		raw *= falsePressureFactor
 	}
 
 	// --- Step 4: migration suppression ---
 	final := raw
 	if stats.RehashActive || stats.MigrationActive {
-		final = raw * 0.3
+		final = raw * migrationSuppressionFactor
 	}
 
 	// --- Step 5: consecutive-window confirmation ---
-	if final > 0.7 {
-		recent := matrix.GetRecent(3)
-		if len(recent) >= 3 {
-			s0 := recomputeScore(recent[0], weights)
-			s1 := recomputeScore(recent[1], weights)
-			if s0 > 0.7 && s1 > 0.7 {
+	if final > migrateThreshold {
+		recent := matrix.GetRecent(consecutiveWindows + 1)
+		if len(recent) >= consecutiveWindows+1 {
+			ok := true
+			for i := 0; i < consecutiveWindows; i++ {
+				s := recomputeScore(recent[i], weights)
+				if s <= migrateThreshold {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return DecisionMigrate, final
+			}
+		} else if len(recent) >= 1 {
+			// Not enough history yet; allow migration if the single current
+			// window is strongly above threshold.
+			if final > migrateThreshold+0.10 {
 				return DecisionMigrate, final
 			}
 		}
@@ -76,23 +108,27 @@ func Decide(stats WindowStats, matrix *FeatureMatrix, weights ScoreWeights) (Dec
 func recomputeScore(stats WindowStats, weights ScoreWeights) float64 {
 	memScore := memGrowthScore(stats.MemGrowthRate)
 	hitScore := hitRateScore(stats.HitRate)
-	nkScore  := newKeysScore(stats.NewKeysRate)
-	evScore  := evictionPressureScore(stats.EvictionsPerSec)
-	bufPen   := bufferPenalty(stats)
+	nkScore := newKeysScore(stats.NewKeysRate)
+	evScore := evictionPressureScore(stats.EvictionsPerSec)
+	keyScore := keysGrowthScore(stats.KeysGrowthRate)
+	bufPen := bufferPenalty(stats)
 	if isFalsePressure(stats) {
 		bufPen = -1.0
 	}
-	raw := weights.MemGrowth*memScore +
+
+	growthScore := math.Max(memScore, keyScore*0.8)
+
+	raw := weights.MemGrowth*growthScore +
 		weights.HitRate*hitScore +
 		weights.NewKeys*nkScore +
 		weights.EvictionPressure*evScore +
 		weights.BufferPenalty*bufPen
 	raw = clamp01(raw)
 	if isFalsePressure(stats) {
-		raw *= 0.4
+		raw *= falsePressureFactor
 	}
 	if stats.RehashActive || stats.MigrationActive {
-		raw *= 0.3
+		raw *= migrationSuppressionFactor
 	}
 	return raw
 }
@@ -100,20 +136,21 @@ func recomputeScore(stats WindowStats, weights ScoreWeights) float64 {
 // --- Per-factor scoring functions (all return [0, 1]) ---
 
 // memGrowthScore: high growth rate → high score (favour migration).
-// MemGrowthRate is a fraction (mem usage ratio change per second).
-// <= 0 → 0; >= 0.3 → 1; linear in between.
+// MemGrowthRate is the memory usage ratio change per second.
+// Thresholds are calibrated for rates computed over multi-second intervals.
+// <= 0 → 0; >= 0.05 → 1; linear in between.
 func memGrowthScore(rate float64) float64 {
 	if rate <= 0 {
 		return 0
 	}
-	if rate >= 0.3 {
+	if rate >= 0.05 {
 		return 1
 	}
-	return rate / 0.3
+	return rate / 0.05
 }
 
 // hitRateScore: low hit rate → high score (cache is inefficient, need more shards).
-// >= 0.95 → 0; <= 0.7 → 1; linear in between.
+// >= 0.95 → 0; <= 0.70 → 1; linear in between.
 func hitRateScore(rate float64) float64 {
 	if rate >= 0.95 {
 		return 0
@@ -146,6 +183,20 @@ func evictionPressureScore(eps float64) float64 {
 		return 0
 	}
 	return (eps - 10) / 90
+}
+
+// keysGrowthScore: high key-count growth → high score (cache filling rapidly).
+// This is an alternative growth signal that does not depend on the system
+// memory monitor, so it is always up-to-date.
+// >= 500 keys/s → 1; <= 0 → 0; linear in between.
+func keysGrowthScore(rate float64) float64 {
+	if rate <= 0 {
+		return 0
+	}
+	if rate >= 500 {
+		return 1
+	}
+	return rate / 500
 }
 
 // bufferPenalty returns a negative score when buffers are stressed.
@@ -204,5 +255,11 @@ func isFalsePressure(stats WindowStats) bool {
 }
 
 func clamp01(v float64) float64 {
-	return math.Max(0, math.Min(1, v))
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
 }
