@@ -107,6 +107,17 @@ type ClientConfig struct {
 	WriteTimeout string `yaml:"write_timeout"`
 }
 
+// MBRMigrationConfig holds the migration executor settings.
+type MBRMigrationConfig struct {
+	CheckInterval       string  `yaml:"check_interval"`
+	MaxMigrationTime    string  `yaml:"max_migration_time"`
+	PauseOnCPUThreshold float64 `yaml:"pause_on_cpu_threshold"`
+	PauseOnMemThreshold float64 `yaml:"pause_on_mem_threshold"`
+	TargetLoadPerShard  int     `yaml:"target_load_per_shard"`
+	MinShards           int     `yaml:"min_shards"`
+	MaxShards           int     `yaml:"max_shards"`
+}
+
 // MBRConfig holds the MBR decision engine settings.
 type MBRConfig struct {
 	Enabled          bool    `yaml:"enabled"`
@@ -125,15 +136,7 @@ type MBRConfig struct {
 		EvictionPressure float64 `yaml:"eviction_pressure"`
 		BufferPenalty    float64 `yaml:"buffer_penalty"`
 	} `yaml:"weights"`
-	Migration struct {
-		CheckInterval       string  `yaml:"check_interval"`
-		MaxMigrationTime    string  `yaml:"max_migration_time"`
-		PauseOnCPUThreshold float64 `yaml:"pause_on_cpu_threshold"`
-		PauseOnMemThreshold float64 `yaml:"pause_on_mem_threshold"`
-		TargetLoadPerShard  int     `yaml:"target_load_per_shard"`
-		MinShards           int     `yaml:"min_shards"`
-		MaxShards           int     `yaml:"max_shards"`
-	} `yaml:"migration"`
+	Migration MBRMigrationConfig `yaml:"migration"`
 }
 
 // LoadConfig reads a YAML configuration file from path.
@@ -234,15 +237,9 @@ func DefaultConfig() Config {
 				EvictionPressure float64 `yaml:"eviction_pressure"`
 				BufferPenalty    float64 `yaml:"buffer_penalty"`
 			}{MemGrowth: 0.35, HitRate: 0.25, NewKeys: 0.20, EvictionPressure: 0.15, BufferPenalty: 0.05},
-			Migration: struct {
-				CheckInterval       string  `yaml:"check_interval"`
-				MaxMigrationTime    string  `yaml:"max_migration_time"`
-				PauseOnCPUThreshold float64 `yaml:"pause_on_cpu_threshold"`
-				PauseOnMemThreshold float64 `yaml:"pause_on_mem_threshold"`
-				TargetLoadPerShard  int     `yaml:"target_load_per_shard"`
-				MinShards           int     `yaml:"min_shards"`
-				MaxShards           int     `yaml:"max_shards"`
-			}{CheckInterval: "100ms", MaxMigrationTime: "5m", PauseOnCPUThreshold: 0.80, PauseOnMemThreshold: 0.85, TargetLoadPerShard: 512, MinShards: 4, MaxShards: 1024},
+			Migration: MBRMigrationConfig{
+				CheckInterval: "100ms", MaxMigrationTime: "5m", PauseOnCPUThreshold: 0.80, PauseOnMemThreshold: 0.85, TargetLoadPerShard: 512, MinShards: 4, MaxShards: 1024,
+			},
 		},
 		Raft: RaftConfig{
 			Enabled:  false,
