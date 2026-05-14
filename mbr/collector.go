@@ -94,16 +94,13 @@ func (p *DefaultStatsProvider) GetLatestStats() WindowStats {
 
 	if totalAccess > 0 {
 		stats.HitRate = float64(h) / float64(totalAccess)
-	} else {
-		stats.HitRate = 1.0 // assume healthy if no data
 	}
 
-	if totalDelta > 0 && dt > 0 {
-		stats.EvictionsPerSec = float64(p.evictions.Load()-p.prevEvict) / dt
-	} else {
-		stats.EvictionsPerSec = 0
+	eCurr := p.evictions.Load()
+	if dt > 0 {
+		stats.EvictionsPerSec = float64(eCurr-p.prevEvict) / dt
 	}
-	p.prevEvict = p.evictions.Load()
+	p.prevEvict = eCurr
 
 	// Avg evicted idle time
 	evCnt := p.evictCnt.Load()
@@ -113,8 +110,10 @@ func (p *DefaultStatsProvider) GetLatestStats() WindowStats {
 
 	// --- Access pattern ---
 	s := p.sets.Load()
-	if s > 0 && totalDelta > 0 {
+	if totalDelta > 0 {
 		stats.NewKeysRate = float64(s) / float64(totalDelta)
+	} else if s > 0 {
+		stats.NewKeysRate = 1.0
 	}
 	if s > 0 {
 		reads := totalDelta - int64(s)
@@ -130,13 +129,12 @@ func (p *DefaultStatsProvider) GetLatestStats() WindowStats {
 			stats.CPUUtil = snap.CPU.UsagePercent / 100
 		}
 		if snap.Memory != nil {
-			currentMem := float64(snap.Memory.Used)
 			stats.MemUsageRatio = snap.Memory.UsedPercent / 100
-			memDelta := currentMem - p.prevMem
+			memDelta := stats.MemUsageRatio - p.prevMem
 			if memDelta > 0 {
 				stats.MemGrowthRate = memDelta / dt
 			}
-			p.prevMem = currentMem
+			p.prevMem = stats.MemUsageRatio
 		}
 		// Disk I/O pressure: aggregate transfer rate relative to 100 MB/s
 		var totalR, totalW float64

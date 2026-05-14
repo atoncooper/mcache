@@ -198,10 +198,33 @@ func (e *IncrementalMigrationExecutor) forceComplete() {
 	e.progress.Store(&MigrationProgress{State: MigrationCompleted})
 }
 
-// calculateTargetShards computes the optimal shard count based on current key
-// count and target load per shard. Result is always a power of two.
+// calculateTargetShards computes the optimal shard count based on key count
+// adjusted by memory pressure. When memory exceeds the PID setpoint, the
+// effective load per shard is scaled down so more shards are requested.
+// Result is always a power of two.
 func (e *IncrementalMigrationExecutor) calculateTargetShards(currentKeys int) int {
-	target := currentKeys / e.cfg.TargetLoadPerShard
+	effectiveLoad := e.cfg.TargetLoadPerShard
+
+	// Reduce effective target load when memory is under pressure so that
+	// large values don't get stuck: 512KB × 1248 keys can saturate memory
+	// while the count-based formula thinks only 4 shards are needed.
+	if e.mon != nil {
+		if snap, ok := e.mon.Latest(); ok && snap.Memory != nil {
+			memRatio := snap.Memory.UsedPercent / 100
+			const setpoint = 0.60
+			if memRatio > setpoint {
+				// Scale factor from 0 (at setpoint) to 1 (at 100%).
+				pressure := (memRatio - setpoint) / (1.0 - setpoint)
+				adjusted := int(float64(effectiveLoad) * (1.0 - pressure*0.75))
+				if adjusted < 64 {
+					adjusted = 64
+				}
+				effectiveLoad = adjusted
+			}
+		}
+	}
+
+	target := currentKeys / effectiveLoad
 	if target < e.cfg.MinShards {
 		target = e.cfg.MinShards
 	}
@@ -211,13 +234,8 @@ func (e *IncrementalMigrationExecutor) calculateTargetShards(currentKeys int) in
 	return nextPowerOfTwo(target)
 }
 
-// currentShardCount is a best-effort estimate. Cache does not expose shard count
-// directly; we infer from the mask used in shardIndex.
 func (e *IncrementalMigrationExecutor) currentShardCount() int {
-	// The Cache uses mask = shardCount - 1, and shardCount is a power of two.
-	// We can't easily extract it, so default to the config minimum.
-	// A future improvement would expose cache.ShardCount() on the public API.
-	return e.cfg.MinShards
+	return e.cache.ShardCount()
 }
 
 func nextPowerOfTwo(n int) int {

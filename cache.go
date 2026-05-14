@@ -347,6 +347,14 @@ func (c *Cache) Len() int {
 	return total
 }
 
+// ShardCount returns the current number of shards.
+func (c *Cache) ShardCount() int {
+	if c.closed.Load() {
+		return 0
+	}
+	return len(c.loadShardTable().shards)
+}
+
 // Close shuts down the cache.
 func (c *Cache) Close() error {
 	c.mu.Lock()

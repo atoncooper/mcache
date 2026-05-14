@@ -100,7 +100,8 @@ func recomputeScore(stats WindowStats, weights ScoreWeights) float64 {
 // --- Per-factor scoring functions (all return [0, 1]) ---
 
 // memGrowthScore: high growth rate → high score (favour migration).
-// <= 0 → 0; >= 0.3 (30% growth/s) → 1; linear in between.
+// MemGrowthRate is a fraction (mem usage ratio change per second).
+// <= 0 → 0; >= 0.3 → 1; linear in between.
 func memGrowthScore(rate float64) float64 {
 	if rate <= 0 {
 		return 0
